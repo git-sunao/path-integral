@@ -1,3 +1,4 @@
 getdist
 numpyro
 pyro-ppl
+distrax
