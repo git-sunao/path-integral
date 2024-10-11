@@ -9,6 +9,7 @@
 - adoptive learning rate? optimizing the architecture? (size of hidden layer, number of transformer)
 - normalization of the action need to be discussed, especially for discretized path integral
 - optimizing the flow equation
+- Aitken algorithm
 
 ## Acknowledgement
 
