@@ -1,4 +1,4 @@
-from typing import Any, List
+from typing import Any, List, Optional
 import dataclasses
 
 import jax
@@ -49,8 +49,8 @@ class MaskedAutoregressiveFlow(nn.Module):
 
         self.flow = TransformedConditional(self.base_dist, self.bijector)
 
-    def __call__(self, x: Array, context: Array = None) -> Array:
-        return self.flow.log_prob(x, context=context)
+    def __call__(self, x: Array, context: Array = None, beta: Optional[float] = 1.0) -> Array:
+        return self.flow.log_prob(x, context=context, beta=beta)
 
-    def sample(self, num_samples: int, rng: Array, context: Array = None) -> Array:
-        return self.flow.sample(seed=rng, sample_shape=(num_samples,), context=context)
+    def sample(self, num_samples: int, rng: Array, context: Array = None, beta: Optional[float] = 1.0) -> Array:
+        return self.flow.sample(seed=rng, sample_shape=(num_samples,), context=context, beta=beta)

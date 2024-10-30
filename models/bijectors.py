@@ -22,15 +22,32 @@ class TransformedConditional(Transformed):
     def __init__(self, distribution, flow):
         super().__init__(distribution, flow)
 
-    def sample(self, seed: PRNGKey, sample_shape: List[int], context: Optional[Array] = None) -> Array:
-        x = self.distribution.sample(seed=seed, sample_shape=sample_shape)
+    def sample(self, seed: PRNGKey, sample_shape: List[int], context: Optional[Array] = None, beta: Optional[float] = 1.0) -> Array:
+        """
+        beta is the annealing parameter
+
+        This has an effect of P(x) -> P^beta(x), and should 
+        have an consequent effect of P(y) -> P^beta(y) where y = f(x)
+        """
+        # x = self.distribution.sample(seed=seed, sample_shape=sample_shape)
+        n_dim = self.distribution.loc.size
+        dist = distrax.MultivariateNormalDiag(jnp.zeros(n_dim), jnp.ones(n_dim)/beta)
+        x = dist.sample(seed=seed, sample_shape=sample_shape)
         y, _ = self.bijector.forward_and_log_det(x, context)
         return y
 
-    def log_prob(self, x: Array, context: Optional[Array] = None) -> Array:
+    def log_prob(self, x: Array, context: Optional[Array] = None, beta: Optional[float] = 1.0) -> Array:
+        """
+        beta is the annealing parameter
+
+        This has an effect of P(x) -> P^beta(x), and should 
+        have an consequent effect of P(y) -> P^beta(y) where y = f(x)
+        """
+        n_dim = self.distribution.loc.size
         x, ildj_y = self.bijector.inverse_and_log_det(x, context)
-        lp_x = self.distribution.log_prob(x)
-        lp_y = lp_x + ildj_y
+        dist = distrax.MultivariateNormalDiag(jnp.zeros(n_dim), jnp.ones(n_dim)/beta)
+        lp_x = dist.log_prob(x)
+        lp_y = lp_x + ildj_y/beta
         return lp_y
 
     def sample_and_log_prob(self, seed: PRNGKey, sample_shape: List[int], context: Optional[Array] = None) -> Tuple[Array, Array]:
