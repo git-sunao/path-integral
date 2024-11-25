@@ -47,7 +47,7 @@ class TransformedConditional(Transformed):
         x, ildj_y = self.bijector.inverse_and_log_det(x, context)
         dist = distrax.MultivariateNormalDiag(jnp.zeros(n_dim), jnp.ones(n_dim)/beta)
         lp_x = dist.log_prob(x)
-        lp_y = lp_x + ildj_y/beta
+        lp_y = lp_x + ildj_y#/beta
         return lp_y
 
     def sample_and_log_prob(self, seed: PRNGKey, sample_shape: List[int], context: Optional[Array] = None) -> Tuple[Array, Array]:
