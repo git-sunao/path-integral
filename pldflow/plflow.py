@@ -9,7 +9,6 @@ from jax import jacobian, hessian
 from jax import jacfwd, jacrev
 from jax import vjp
 from jax.lax import scan
-from jax.experimental.ode import odeint
 from tqdm import tqdm
 # getdist
 from getdist import MCSamples
@@ -32,38 +31,87 @@ import flax.linen as nn
 import optax
 from sklearn import datasets, preprocessing
 from .maf import MaskedAutoregressiveFlow
-# from nsf import NeuralSplineFlow
+# odeint
+from jax.experimental.ode import odeint
+from .odeint import euler
 
 class PicardLefschetzModelBaseClass(object):
     """
     Z = \int dx e^{-S(x)}
     """
+    ndim: int = 1
     def __init__(self):
         self.rescale_velocity = True
         self.complex_dtype = jnp.complex64
 
     # Functions
     def action_s(self, z, *args, **kwargs):
+        """
+        Action function S(z) = -log(I(z))
+
+        Parameters:
+            z (array): The real or complex variable z with shape (ndim,)
+            args: Additional arguments to pass to the action function
+
+        Returns:
+            s (array): The action function evaluated at z, scalar
+        """
         raise NotImplementedError("action_s must be implemented in a subclass")
 
     def grad_s(self, z, *args, **kwargs):
+        """
+        Gradient of the action function dS/dz
+
+        Parameters:
+            z (array): The real or complex variable z with shape (ndim,)
+            args: Additional arguments to pass to the action function
+
+        Returns:
+            g (array): The gradient of the action function evaluated at z with shape (ndim,)
+        """
         g = grad(self.action_s, argnums=0, holomorphic=True)
         return g(z, *args, **kwargs)
 
     def hessian_s(self, z, *args, **kwargs):
+        """
+        Hessian of the action function d^2S/dz^2
+
+        Parameters:
+            z (array): The real or complex variable z with shape (ndim,)
+            args: Additional arguments to pass to the action function
+        
+        Returns:
+            h (array): The Hessian of the action function evaluated at z with shape (ndim, ndim)
+        """
         h = hessian(self.action_s, argnums=0, holomorphic=True)
         return h(z, *args, **kwargs)
 
-    def jacobian_s(self, z, *args, **kwargs):
-        j = jacobian(self.action_s, argnums=0, holomorphic=True)
-        return j(z, *args, **kwargs)
-
     def integrand(self, z, *args, **kwargs):
+        """
+        Integrand function I(z) = e^{-S(z)}
+
+        Parameters:
+            z (array): The real or complex variable z with shape (ndim,)
+            args: Additional arguments to pass to the action function
+
+        Returns:
+            i (array): The integrand function evaluated at z, scalar
+        """
         s = self.action_s(z, *args, **kwargs)
         return jnp.exp(-s)
 
     # PL flow
     def flow_velocity(self, z, *args, **kwargs):
+        """
+        Velocity of the Picard-Leffschetz flow dz/dt = v(z)
+
+        Parameters:
+            z (array): The real or complex variable z with shape (ndim,)
+            args: Additional arguments to pass to the action function
+        
+        Returns:
+            v (array): The velocity of the flow evaluated at z with shape (ndim,)
+        """
         # Gradient of the action
         dsdz = self.grad_s(z, *args, **kwargs)
         # Velocity for the flow
@@ -75,82 +123,134 @@ class PicardLefschetzModelBaseClass(object):
         return v
 
     def flow(self, x, t, *args, **kwargs):
+        """
+        Solve the Picard-Lefschetz flow for a given initial condition x
+
+        Parameters:
+            x (array): The real-valued initial condition with shape (ndim,)
+            t (array/scalar): The time array for integration
+            args: Additional arguments to pass to the action function
+            kwargs: Additional keyword arguments
+
+        Returns:
+            z (array): The solution of the flow at each time step with shape (ndim, t.size)
+
+        Notes:
+            The method of integration can be set with the keyword `method` (default is 'euler')
+        """
+        # pop the method
+        method = kwargs.pop('method', 'euler')
+        uselast= kwargs.pop('uselast', False)
+
+        # Initial condition and flow velocity
         z0 = jnp.array(x, dtype=self.complex_dtype)
         flow_vel = lambda z, t: self.flow_velocity(z, *args, **kwargs)
+
+        # Time array
         if isinstance(t, (int, float)):
             t = jnp.linspace(0, t, 2)
+            uselast = True
+
+        # Integration
+        if method == 'euler':
+            z = euler(flow_vel, z0, t)
+        elif method == 'odeint':
             z = odeint(flow_vel, z0, t)
+        else:
+            raise ValueError(f"Invalid method {method=}")
+
+        if uselast:
             return z[-1]
         else:
-            z = odeint(flow_vel, z0, t)
             return z
     
     def flow_jacobian(self, x, t, *args, **kwargs):
+        """
+        Jacobian of the Picard-Lefschetz flow at a given initial condition x.
+
+        Parameters:
+            x (array): The real-valued initial condition with shape (ndim,)
+            t (array/scalar): The time array for integration
+            args: Additional arguments to pass to the action function
+            kwargs: Additional keyword arguments
+
+        Returns:
+            j (array): The Jacobian of the flow evaluated at x with shape (ndim, ndim)
+        """
         def flow_split(x):
             z = self.flow(x, t, *args, **kwargs)
             return jnp.real(z), jnp.imag(z)
-        j = jacobian(flow_split, argnums=0)(x)
+        j = jacrev(flow_split)(x)
         j = j[0] + 1j * j[1]
-        if j.ndim == 0:
-            return j
-        elif j.shape[0] == j.shape[1]:
-            return jnp.linalg.det(j)
-        else:
-            raise ValueError(f"Unexpected shape for Jacobian: {j.shape}")
+        return jnp.linalg.det(j)
 
     # Integration with samples
     def integrate(self, x_samples, lnp_samples, t, *args, **kwargs):
-        # We should cut samples with very small probability to avoid numerical issues
+        """
+        Integrate the integrand I(z) = e^{-S(z)} based on the importance 
+        sampling using the samples of x provided with the corresponding 
+        log-probability lnp_samples.
+
+        Parameters:
+            x_samples (array): The samples of x with shape (nsamples, ndim)
+            lnp_samples (array): The log-probability of the samples with shape (nsamples,)
+            t (array/scalar): The time array for integration
+            args: Additional arguments to pass to the action function
+            kwargs: Additional keyword arguments
+        
+        Returns:
+            Z (scalar): The integrated value of the integrand
+        """
         from time import time
-        t0 = time()
-        z = self.vflow(x_samples, t, *args, **kwargs)
-        t1 = time()
-        j = self.vflow_jacobian(x_samples, t, *args, **kwargs)
-        t2 = time()
-        i = self.vintegrand(x_samples, *args, **kwargs)
-        t3 = time()
+        def zji(x_sample):
+            t0 = time()
+            z = self.flow(x_sample, t, uselast=True, *args, **kwargs)
+            t1 = time()
+            j = self.flow_jacobian(x_sample, t, uselast=True, *args, **kwargs)
+            t2 = time()
+            i = self.integrand(z, *args, **kwargs)
+            t3 = time()
+            print(f"Flow: {t1-t0:.2f} sec, Jacobian: {t2-t1:.2f} sec, Integrand: {t3-t2:.2f} sec ")
+            return z, j, i 
+        # We should cut samples with very small probability to avoid numerical issues
+        z, j, i = vmap(zji)(x_samples)
         Z = jnp.mean(i*j*jnp.exp(-lnp_samples), axis=0)
-        t4 = time()
-        print(f"Flow: {t1-t0:.2f} s, Jacobian: {t2-t1:.2f} s, Integrand: {t3-t2:.2f} s, Mean: {t4-t3:.2f} s")
         return Z
 
     # Vectorized functions
     def vaction_s(self, z, *args, **kwargs):
+        """Vectorized action function"""
         s = vmap(lambda zin: self.action_s(zin, *args, **kwargs), in_axes=0, out_axes=0)
         return s(z)
 
     def vgrad_s(self, z, *args, **kwargs):
+        """Vectorized gradient of the action function"""
         g = vmap(lambda zin: self.grad_s(zin, *args, **kwargs), in_axes=0, out_axes=0)
         return g(z)
 
     def vhessian_s(self, z, *args, **kwargs):
+        """Vectorized Hessian of the action function"""
         h = vmap(lambda zin: self.hessian_s(zin, *args, **kwargs), in_axes=0, out_axes=0)
         return h(z)
 
-    def vjacobian_s(self, z, *args, **kwargs):
-        j = vmap(lambda zin: self.jacobian_s(zin, *args, **kwargs), in_axes=0, out_axes=0)
-        return j(z)
-
     def vintegrand(self, z, *args, **kwargs):
+        """Vectorized integrand function"""
         i = vmap(lambda zin: self.integrand(zin, *args, **kwargs), in_axes=0, out_axes=0)
         return i(z)
 
     def vflow(self, z, t, *args, **kwargs):
+        """Vectorized flow function"""
         f = vmap(lambda zin: self.flow(zin, t, *args, **kwargs), in_axes=0, out_axes=0)
         return f(z)
 
     def vflow_jacobian(self, z, t, *args, **kwargs):
+        """Vectorized flow Jacobian function"""
         f = vmap(lambda zin: self.flow_jacobian(zin, t, *args, **kwargs), in_axes=0, out_axes=0)
         return f(z)
 
     # Plotter
     def _plot1d_template(self, fig=None, axes=None):
-        # if fig is None and axes is None:
-        #     fig = plt.figure(figsize=(5,6))
-        #     ax1 = fig.add_axes((.1,.3,.8,.6))
-        #     ax2 = fig.add_axes((.1,.05,.8,.15), sharex=ax1)
-        # else:
-        #     ax1, ax2 = axes
+        """Template for the 1D plotter"""
         fig = plt.figure(figsize=(5,6))
         ax1 = fig.add_axes((.15,.30,.75,.55))
         ax2 = fig.add_axes((.15,.10,.75,.15), sharex=ax1)
@@ -164,11 +264,29 @@ class PicardLefschetzModelBaseClass(object):
         return fig, [ax1, ax2]
 
     def plot1d(self, x, t, *args, **kwargs):
+        """
+        Plot the flow of the Picard-Lefschetz flow in 1D
+
+        Parameters:
+            x (array): The real-valued initial condition with shape (n,)
+            t (array/scalar): The time array for integration
+            args: Additional arguments to pass to the action function
+            kwargs: Additional keyword arguments
+
+        Returns:
+            fig, (ax1, ax2): The figure and axes for the plot
+
+        Notes:
+            Acceptable keyword arguments for this function are:
+            - dim: The dimension to plot (default is 0)
+        """
+        # dimension to plot
+        dim = kwargs.pop('dim', 0)
+
         if isinstance(t, (int, float)):
             t = jnp.linspace(0, t, 2)
         z = self.vflow(x, t, *args, **kwargs)
-        iz= self.vintegrand(z, *args, **kwargs)
-        ix= self.integrand(x, *args, **kwargs)
+        iz= self.vintegrand(z.reshape(-1, self.ndim), *args, **kwargs).reshape(-1, t.size)
 
         color = []
         for i in range(t.size):
@@ -177,7 +295,7 @@ class PicardLefschetzModelBaseClass(object):
         fig, (ax1, ax2) = self._plot1d_template()
         # Plot the path
         for i in range(t.size):
-            ax1.plot(z[:,i].real, z[:,i].imag, marker='.', color=color[i])
+            ax1.plot(z[:,i,dim].real, z[:,i,dim].imag, marker='.', color=color[i])
         ax1.set_xlim(x.min(),x.max())
         ax1.set_ylim(x.min(),x.max())
         ax1.axhline(0, color='black', lw=1, ls='--')
@@ -190,11 +308,27 @@ class PicardLefschetzModelBaseClass(object):
         return fig, (ax1, ax2)
 
     def plot1dgif(self, fname, x, t, *args, **kwargs):
+        """
+        Plot the flow of the Picard-Lefschetz flow in 1D and save it as a GIF
+
+        Parameters:
+            fname (str): The filename to save the GIF
+            x (array): The real-valued initial condition with shape (n,)
+            t (array/scalar): The time array for integration
+            args: Additional arguments to pass to the action function
+            kwargs: Additional keyword arguments
+
+        Notes:
+            Acceptable keyword arguments for this function are:
+            - dim: The dimension to plot (default is 0)
+        """
+        # dimension to plot
+        dim = kwargs.pop('dim', 0)
+
         if isinstance(t, (int, float)):
             t = jnp.linspace(0, t, 2)
         z = self.vflow(x, t, *args, **kwargs)
-        iz= self.vintegrand(z, *args, **kwargs)
-        ix= self.integrand(x, *args, **kwargs)
+        iz= self.vintegrand(z.reshape(-1, self.ndim), *args, **kwargs).reshape(-1, t.size)
 
         fig, (ax1, ax2) = self._plot1d_template()
         ax1.set_xlim(x.min(),x.max())
@@ -206,10 +340,10 @@ class PicardLefschetzModelBaseClass(object):
         line4, = ax2.plot([], [], ls='-', color='blue')
 
         def update(i):
-            line1.set_data(z[:, i].real, z[:, i].imag)
-            line2.set_data(x, jnp.real(iz[:, i]))
-            line3.set_data(x, jnp.imag(iz[:, i]))
-            line4.set_data(x, jnp.abs(iz[:, i]))
+            line1.set_data(z[:,i,dim].real, z[:,i,dim].imag)
+            line2.set_data(x, jnp.real(iz[:,i]))
+            line3.set_data(x, jnp.imag(iz[:,i]))
+            line4.set_data(x, jnp.abs(iz[:,i]))
             return line1, line2, line3, line4
         
         ani = FuncAnimation(fig, update, frames=t.size, interval=50, blit=True)
@@ -224,107 +358,171 @@ class HMCSampler(object):
     def set_priors(self, priors):
         """
         Set the priors for the parameters of the action
-        
-        Parameters
-        ----------
-        priors : dict
-            Dictionary with the priors for the parameters of the action.
-            The keys are the parameter names and the values are the priors.
-            The priors can be either a tuple with the range (vmin, vmax) or
-            a tuple with the range and the number of dimensions (vmin, vmax, ndim).
+
+        Parameters:
+            priors (dict): The dictionary of priors for the parameters
         """
+        # Set priors
         self.priors = dict()
-        assert 'x' in priors, "Prior on `x` is required"
+        # 1. populate the priors from the grouped priors
         for k, v in priors.items():
-            # Get the range of the prior
-            if len(v) == 2:
-                vmin = v[0]
-                vmax = v[1]
-                ndim = 0
-            elif len(v) == 3:
-                vmin = v[0]
-                vmax = v[1]
-                ndim = v[2]
-            else:
-                raise ValueError(f"Invalid prior format {v=}")
-            assert isinstance(vmin, (int, float)), f"Invalid vmin {vmin=}"
-            assert isinstance(vmax, (int, float)), f"Invalid vmax {vmax=}"
-            assert isinstance(ndim, int), f"Invalid ndim {ndim=}"
-            self.priors[k] = (vmin, vmax, ndim)
-
-    def get_param_names(self, separate=False):
-        priors = self.priors.copy()
-        # parameter name of x
-        vmin, vmax, ndim = priors.pop('x')
-        names_x = []
-        if ndim == 0:
-            names_x.append('x')
-        else:
+            if len(v) == 2: continue
+            vmin, vmax, ndim = v
             for i in range(ndim):
-                names_x.append(f'x{i+1}')
-        # parameter name of other parameters
-        names_o = []
+                self.priors[f"{k}{i+1}"] = (vmin, vmax)
+        # 2. populate the priors for ungrouped priors
         for k, v in priors.items():
+            if len(v) == 3: continue
+            vmin, vmax = v
+            self.priors[k] = (vmin, vmax)
+        
+        # Set parameter names
+        self.param_names = []
+        self.group_names = []
+        # 1. populate the priors from the grouped priors
+        for k, v in priors.items():
+            if len(v) == 2: continue
             vmin, vmax, ndim = v
-            if ndim == 0:
-                names_o.append(k)
+            for i in range(ndim):
+                self.param_names.append(f"{k}{i+1}")
+                self.group_names.append(k)
+        # 2. populate the priors for ungrouped priors
+        for k, v in priors.items():
+            if len(v) == 3: continue
+            if k in self.param_names: continue
+            self.param_names.append(k)
+            self.group_names.append(k)
+
+        # Determine the dimenion of each group
+        self.group_ndims = dict()
+        for g, n in zip(self.group_names, self.param_names):
+            dim = 0 if g == n else 1
+            if g in self.group_ndims:
+                self.group_ndims[g] += dim
             else:
-                for i in range(ndim):
-                    names_o.append(f"{k}{i+1}")
-        if separate:
-            return names_x, names_o
-        else:
-            return names_x + names_o
+                self.group_ndims[g] = dim
 
-    def get_n_dim(self):
-        names_x, names_o = self.get_param_names(separate=True)
-        return len(names_x)
+    def get_priors(self):
+        """
+        Get the priors for the parameters
+        
+        Returns:
+            dict: The dictionary of priors for the parameters
+        """
+        return self.priors.copy()
 
-    def get_n_context(self):
-        names_x, names_o = self.get_param_names(separate=True)
-        return len(names_o)
+    # Utility functions 
+    def get_group_names(self, include=None, exclude=None):
+        """
+        Get the group names for the parameters
 
-    def numpyro_model(self, t=1.0):
-        # Genrate the parameters 
+        Parameters:
+            include (list): The list of group names to include
+            exclude (list): The list of group names to exclude
+        
+        Returns:
+            list: The list of group names
+        """
+        if include is None:
+            include = self.group_names.copy()
+        elif isinstance(include, str):
+            include = [include]
+        if exclude is None:
+            exclude = []
+        elif isinstance(exclude, str):
+            exclude = [exclude]
+        return [g for g in include if g not in exclude]
+
+    def get_param_names(self, include=None, exclude=None):
+        """
+        Get the parameter names
+
+        Parameters:
+            include (list): The list of parameter names to include
+            exclude (list): The list of parameter names to exclude
+        
+        Returns:
+            list: The list of parameter names
+        """
+        gnames = self.get_group_names(include=include, exclude=exclude)
+        param_names = []
+        for pname, gname in zip(self.param_names, self.group_names):
+            if gname not in gnames: continue
+            param_names.append(pname)
+        return param_names
+
+    def get_group_ndim(self, include=None, exclude=None):
+        """
+        Get the dimension of each group
+
+        Parameters:
+            include (list): The list of group names to include
+            exclude (list): The list of group names to exclude
+        
+        Returns:
+            dict: The dictionary of group names and their dimensions
+        """
+        gnames = self.get_group_names(include=include, exclude=exclude)
+        group_ndims = dict()
+        for gname, ndim in self.group_ndims.items():
+            if gname not in gnames: continue
+            group_ndims[gname] = ndim
+        return group_ndims
+
+    def get_ndim(self, include=None, exclude=None):
+        """
+        Get the total dimension of the parameters
+        
+        Parameters:
+            include (list): The list of group names to include
+            exclude (list): The list of group names to exclude
+
+        Returns:
+            int: The total dimension of the parameters
+        """
+        group_ndims = self.get_group_ndim(include=include, exclude=exclude)
+        return sum(group_ndims.values())
+
+    # Sampling related functions
+    def likelihood_model(self, t=1.0):
+        # Genrate the parameters
         parameters = dict()
-        for k, v in self.priors.items():
-            # Set the prior
-            vmin, vmax, ndim = v
+        for gname in self.get_group_names():
+            ndim = self.get_group_ndim(gname)
             if ndim == 0:
-                p = numpyro.sample(k, npyro_dist.Uniform(vmin, vmax))
+                name = self.get_param_names(include=gname)[0]
+                vmin, vmax = self.get_priors()[name]
+                parameter = numpyro.sample(gname, npyro_dist.Uniform(vmin, vmax))
             else:
-                p = []
-                for i in range(ndim):
-                    pi = numpyro.sample(f"{k}{i+1}", npyro_dist.Uniform(vmin, vmax))
-                    p.append(pi)
-                p = jnp.array(p)
-            parameters[k] = p
+                parameter = []
+                names = self.get_param_names(include=gname)                
+                for name in names:
+                    vmin, vmax = self.get_priors()[name]
+                    p = numpyro.sample(name, npyro_dist.Uniform(vmin, vmax))
+                    parameter.append(p)
+                parameter = jnp.array(parameter)
+            parameters[gname] = parameter
             
         # flow
-        z = self.plmodel.flow(t=t, **parameters)
-        j = self.plmodel.flow_jacobian(t=t, **parameters)
+        z = self.plmodel.flow(t=t, uselast=True, **parameters)
+        j = self.plmodel.flow_jacobian(t=t, uselast=True, **parameters)
         parameters.pop('x')
 
         # Integrand
         parameters['z'] = z
-        i = self.plmodel.integrand(**parameters)
-
-        # Target probability distribution
-        amplt = jnp.abs(i)
-        # phase = i*j/amplt
+        logp = -self.plmodel.action_s(**parameters).real
 
         # Set likelihood and derived values
-        numpyro.factor('loglike', jnp.log(amplt))
-        # numpyro.deterministic('phase', phase)
-        # numpyro.deterministic('amplt', amplt)
+        numpyro.factor('loglike', logp)
 
-    def sample(self, num_samples=10000, num_warmup=500, seed=0):
-        nuts_kernel = NUTS(self.numpyro_model)
+    def sample(self, num_samples=5000, num_warmup=500, seed=0, **like_kwargs):
+        nuts_kernel = NUTS(self.likelihood_model)
         self.mcmc = MCMC(nuts_kernel, num_warmup=num_warmup, num_samples=num_samples)
         cpu_device = jax.devices('cpu')[0]
         with jax.default_device(cpu_device):
-            self.mcmc.run(jax.random.PRNGKey(seed))
+            self.mcmc.run(jax.random.PRNGKey(seed), **like_kwargs)
 
+    # Getter functions
     def get_samples(self, format=jnp.array, names=None):
         # Get the samples as a dictionary
         samples_dict = self.mcmc.get_samples()
@@ -338,14 +536,7 @@ class HMCSampler(object):
             samples = jnp.array([samples_dict[k] for k in names]).T
         elif format == MCSamples:
             arrs    = jnp.array([samples_dict[k] for k in names], dtype=float).T
-            ranges  = dict()
-            for k, v in self.priors.items():
-                vmin, vmax, ndim = v
-                if ndim == 0:
-                    ranges[k] = [vmin, vmax]
-                else:
-                    for i in range(ndim):
-                        ranges[f"{k}{i+1}"] = [vmin, vmax]
+            ranges  = self.get_priors()
             samples = MCSamples(samples=arrs, names=names, ranges=ranges)
             samples.names = names # append names for the ease of use
         else:
@@ -365,8 +556,8 @@ class MAFModel(object):
         # Overwrite the default configuration
         config.update(config_in)
         # Dimension is always set from prior
-        config['n_dim']     = self.sampler.get_n_dim()
-        config['n_context'] = self.sampler.get_n_context()
+        config['n_dim']     = self.sampler.get_ndim(include='x')
+        config['n_context'] = self.sampler.get_ndim(exclude='x')
         # Initialize the MAF model
         self.model = MaskedAutoregressiveFlow(**config)
 
@@ -407,7 +598,7 @@ class MAFModel(object):
             return params, opt_state, loss
 
         # Samples for training
-        names   = self.sampler.get_param_names(separate=False)
+        names   = self.sampler.get_param_names()
         samples = self.sampler.get_samples(format=jnp.array, names=names)
 
         # Training loop!
