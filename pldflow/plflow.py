@@ -10,8 +10,6 @@ from jax import jacfwd, jacrev
 from jax import vjp
 from jax.lax import scan
 from tqdm import tqdm
-# getdist
-from getdist import MCSamples
 # numpyro
 import numpyro
 import numpyro.distributions as npyro_dist
@@ -24,6 +22,7 @@ import pyro.distributions.transforms as T
 # others
 from inspect import signature
 # plottting
+from getdist import MCSamples
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 # Normalizing Flows
@@ -37,7 +36,14 @@ from .odeint import euler
 
 class PicardLefschetzModelBaseClass(object):
     """
-    Z = \int dx e^{-S(x)}
+    Base class for the Picard-Lefschetz model.
+    The target is to solve the integral of the form
+        Z = \int dx e^{-S(x)}
+
+    Attributes:
+        ndim (int): The dimension of the model
+        rescale_velocity (bool): Whether to rescale the velocity
+        complex_dtype (dtype): The dtype for the complex numbers
     """
     ndim: int = 1
     def __init__(self):
@@ -119,7 +125,7 @@ class PicardLefschetzModelBaseClass(object):
         # Rescale the velocity
         if self.rescale_velocity:
             i = self.integrand(z, *args, **kwargs)
-            v = v * jnp.abs(i)
+            v = v * jnp.abs(i)**0.5
         return v
 
     def flow(self, x, t, *args, **kwargs):
@@ -180,7 +186,8 @@ class PicardLefschetzModelBaseClass(object):
         def flow_split(x):
             z = self.flow(x, t, *args, **kwargs)
             return jnp.real(z), jnp.imag(z)
-        j = jacrev(flow_split)(x)
+        # j = jacrev(flow_split)(x)
+        j = jacobian(flow_split)(x)
         j = j[0] + 1j * j[1]
         return jnp.linalg.det(j)
 
@@ -202,7 +209,7 @@ class PicardLefschetzModelBaseClass(object):
             Z (scalar): The integrated value of the integrand
         """
         from time import time
-        def zji(x_sample):
+        def ij(x_sample):
             t0 = time()
             z = self.flow(x_sample, t, uselast=True, *args, **kwargs)
             t1 = time()
@@ -210,11 +217,14 @@ class PicardLefschetzModelBaseClass(object):
             t2 = time()
             i = self.integrand(z, *args, **kwargs)
             t3 = time()
-            print(f"Flow: {t1-t0:.2f} sec, Jacobian: {t2-t1:.2f} sec, Integrand: {t3-t2:.2f} sec ")
-            return z, j, i 
+            # print(f"Flow: {t1-t0:.3f} sec, Jacobian: {t2-t1:.3f} sec, Integrand: {t3-t2:.3f} sec ")
+            return i, j
         # We should cut samples with very small probability to avoid numerical issues
-        z, j, i = vmap(zji)(x_samples)
-        Z = jnp.mean(i*j*jnp.exp(-lnp_samples), axis=0)
+        min_lnp = kwargs.pop('min_lnp', -6)
+        sel = lnp_samples > lnp_samples.max() + min_lnp
+        # Integrate the integrand
+        i, j = vmap(ij)(x_samples[sel])
+        Z = jnp.mean(i*j*jnp.exp(-lnp_samples[sel]), axis=0)
         return Z
 
     # Vectorized functions
@@ -341,9 +351,9 @@ class PicardLefschetzModelBaseClass(object):
 
         def update(i):
             line1.set_data(z[:,i,dim].real, z[:,i,dim].imag)
-            line2.set_data(x, jnp.real(iz[:,i]))
-            line3.set_data(x, jnp.imag(iz[:,i]))
-            line4.set_data(x, jnp.abs(iz[:,i]))
+            line2.set_data(x[:,dim], jnp.real(iz[:,i]))
+            line3.set_data(x[:,dim], jnp.imag(iz[:,i]))
+            line4.set_data(x[:,dim], jnp.abs(iz[:,i]))
             return line1, line2, line3, line4
         
         ani = FuncAnimation(fig, update, frames=t.size, interval=50, blit=True)
@@ -351,7 +361,24 @@ class PicardLefschetzModelBaseClass(object):
 
 
 class HMCSampler(object):
+    """
+    Hamiltonian Monte Carlo sampler for the action
+
+    Attributes:
+        plmodel (PicardLefschetzModelBaseClass): The Picard-Lefschetz model
+        priors (dict): The dictionary of priors for the parameters
+        param_names (list): The list of parameter names
+        group_names (list): The list of group names
+        group_ndims (dict): The dictionary of group names and their dimensions
+    """
     def __init__(self, plmodel, priors):
+        """
+        Initialize the HMC sampler for the action
+
+        Parameters:
+            plmodel (PicardLefschetzModelBaseClass): The Picard-Lefschetz model
+            priors (dict): The dictionary of priors for the parameters
+        """
         self.plmodel = plmodel
         self.set_priors(priors)
 
@@ -431,7 +458,12 @@ class HMCSampler(object):
             exclude = []
         elif isinstance(exclude, str):
             exclude = [exclude]
-        return [g for g in include if g not in exclude]
+        gnames = []
+        for g in include:
+            if g in exclude: continue
+            if g in gnames: continue
+            gnames.append(g)
+        return gnames
 
     def get_param_names(self, include=None, exclude=None):
         """
@@ -485,15 +517,27 @@ class HMCSampler(object):
 
     # Sampling related functions
     def likelihood_model(self, t=1.0):
+        """
+        The likelihood model for the parameters
+
+        Parameters:
+            t (array/float): The time for the flow
+
+        Notes:
+            The likelihood model is defined as a function for the parameters
+            with the signature likelihood_model(t, **parameters)
+        """ 
         # Genrate the parameters
         parameters = dict()
         for gname in self.get_group_names():
             ndim = self.get_group_ndim(gname)
             if ndim == 0:
+                # generate a parameter as a scalar
                 name = self.get_param_names(include=gname)[0]
                 vmin, vmax = self.get_priors()[name]
-                parameter = numpyro.sample(gname, npyro_dist.Uniform(vmin, vmax))
+                parameter = numpyro.sample(name, npyro_dist.Uniform(vmin, vmax))
             else:
+                # generate a parameter as a vector
                 parameter = []
                 names = self.get_param_names(include=gname)                
                 for name in names:
@@ -505,17 +549,28 @@ class HMCSampler(object):
             
         # flow
         z = self.plmodel.flow(t=t, uselast=True, **parameters)
-        j = self.plmodel.flow_jacobian(t=t, uselast=True, **parameters)
+        # j = self.plmodel.flow_jacobian(t=t, uselast=True, **parameters)
         parameters.pop('x')
 
         # Integrand
         parameters['z'] = z
-        logp = -self.plmodel.action_s(**parameters).real
+        lnp = -self.plmodel.action_s(**parameters).real
+        # i   = self.plmodel.integrand(**parameters)
+        # lnp = jnp.log(jnp.abs(i*j))
 
         # Set likelihood and derived values
-        numpyro.factor('loglike', logp)
+        numpyro.factor('loglike', lnp)
 
     def sample(self, num_samples=5000, num_warmup=500, seed=0, **like_kwargs):
+        """
+        Sample the parameters using the likelihood model
+
+        Parameters:
+            num_samples (int): The number of samples to generate
+            num_warmup (int): The number of warmup samples
+            seed (int): The seed for random number generation
+            like_kwargs (dict): The keyword arguments for the likelihood model
+        """
         nuts_kernel = NUTS(self.likelihood_model)
         self.mcmc = MCMC(nuts_kernel, num_warmup=num_warmup, num_samples=num_samples)
         cpu_device = jax.devices('cpu')[0]
@@ -524,6 +579,16 @@ class HMCSampler(object):
 
     # Getter functions
     def get_samples(self, format=jnp.array, names=None):
+        """
+        Get the samples from the MCMC run
+
+        Parameters:
+            format (type): The format of the samples (default is jnp.array)
+            names (list): The list of parameter names to include
+
+        Returns:
+            array: The samples from the MCMC run
+        """
         # Get the samples as a dictionary
         samples_dict = self.mcmc.get_samples()
         # List of names to be returned
@@ -544,24 +609,62 @@ class HMCSampler(object):
         return samples
 
 class MAFModel(object):
-    def __init__(self, sampler):
+    """
+    Masked Autoregressive Flow model for the action
+
+    Attributes:
+        sampler (HMCSampler): The HMC sampler for the action
+        model (MaskedAutoregressiveFlow): The MAF model
+        trained_params (dict): The trained parameters of the MAF model
+        loss_history_maf (list): The history of the training loss for the MAF model
+    """
+    def __init__(self, sampler, process=True):
         self.sampler = sampler
+        self.ndim_x = self.sampler.get_ndim(include='x')
+        self.ndim_c = self.sampler.get_ndim(exclude='x')
+        self.process = process
+        self.compute_processing_params()
 
     def build(self, **config_in):
+        """
+        Build the MAF model
+
+        Parameters:
+            config_in (dict): The configuration for the MAF model
+
+        Notes:
+            The configuration can include the following keys:
+            - hidden_dims: The list of hidden dimensions for the MAF model (default is [128, 128])
+            - activation: The activation function for the MAF model (default is "tanh")
+            - n_transforms: The number of transformations for the MAF model (default is 4)
+            - use_random_permutations: Whether to use random permutations (default is False)
+        """
         # Default configuration
         config =   {'hidden_dims': [128, 128], \
                     'activation': "tanh", \
                     'n_transforms': 4, \
-                    'use_random_permutations': False}
+                    'use_random_permutations': False, 
+                    'n_dim': self.ndim_x, \
+                    'n_context': self.ndim_c}
         # Overwrite the default configuration
         config.update(config_in)
-        # Dimension is always set from prior
-        config['n_dim']     = self.sampler.get_ndim(include='x')
-        config['n_context'] = self.sampler.get_ndim(exclude='x')
         # Initialize the MAF model
         self.model = MaskedAutoregressiveFlow(**config)
 
     def train(self, **config_in):
+        """
+        Train the MAF model using the samples from the sampler
+
+        Parameters:
+            config_in (dict): The configuration for the training
+
+        Notes:
+            The configuration can include the following keys:
+            - seed: The seed for random number generation (default is 0)
+            - learning_rate: The learning rate for the optimizer (default is 3e-4)
+            - batch_size: The batch size for training (default is 64)
+            - n_steps: The number of training steps (default is 1000)
+        """
         # Default configuration
         config  =  {'seed': 0, \
                     'learning_rate': 3e-4, \
@@ -569,14 +672,11 @@ class MAFModel(object):
                     'n_steps': 1000}
         # Overwrite the default configuration
         config.update(config_in)
-        # Get n_dim and n_context from model
-        config['n_dim']     = self.model.n_dim
-        config['n_context'] = self.model.n_context
 
         # Initialize the model
         key    = jax.random.PRNGKey(config['seed'])
-        x_test = jax.random.uniform(key=key, shape=(config['batch_size'], config['n_dim']))
-        context= jax.random.uniform(key=key, shape=(config['batch_size'], config['n_context']))
+        x_test = jax.random.uniform(key=key, shape=(config['batch_size'], self.ndim_x))
+        context= jax.random.uniform(key=key, shape=(config['batch_size'], self.ndim_c))
         params = self.model.init(key, x_test, context)
 
         # Optimizer
@@ -598,8 +698,7 @@ class MAFModel(object):
             return params, opt_state, loss
 
         # Samples for training
-        names   = self.sampler.get_param_names()
-        samples = self.sampler.get_samples(format=jnp.array, names=names)
+        samples = self.get_training_samples()
 
         # Training loop!
         self.loss_history_maf = []
@@ -607,13 +706,14 @@ class MAFModel(object):
         for _ in tqdm(range(config['n_steps']), desc="Training MAF"):
             key, subkey = jax.random.split(key)
             indices = jax.random.choice(subkey, samples.shape[0], shape=(64,), replace=False)
-            batch = (samples[indices, :config['n_dim']], samples[indices, config['n_dim']:])
+            batch = (samples[indices, :self.ndim_x], samples[indices, self.ndim_x:])
             params, opt_state, loss = step(params, opt_state, batch)
             self.loss_history_maf.append(loss)
 
         self.trained_params = params
 
     def plot_loss(self):
+        """Plot the training loss"""
         plt.figure(figsize=(5,3))
         plt.plot(self.loss_history_maf)
         plt.yscale('log')
@@ -622,28 +722,261 @@ class MAFModel(object):
         plt.title('Training Loss')
         plt.show()
 
-    def sample(self, context, num_samples=10000, seed=0):
-        key = jax.random.PRNGKey(seed)
-        if context.ndim == 0 or context.ndim == 1:
-            context = jnp.tile(context, (num_samples, 1))
+    def sample(self, context, num_samples=10000, seed=0, beta=1.0):
+        """
+        Sample from the trained MAF model
 
-        def sampling_fn(m):
-            x = m.sample(num_samples=num_samples, rng=key, context=context, beta=1.0)
-            return x
-
-        x = nn.apply(sampling_fn, self.model)(self.trained_params)
-        return jnp.array(x)
-
-    def log_prob(self, x, context):
-        # Get the number of samples from x input
-        num_samples = x.shape[0]
+        Parameters:
+            context (array): The context for the sampling with shape (n_context,)
+            num_samples (int): The number of samples to generate
+            seed (int): The seed for random number generation
+        
+        Returns:
+            array: The samples from the MAF model with shape (num_samples, n_dim)
+        """
         # Format the context shape if necessary
         if context.ndim == 0 or context.ndim == 1:
             context = jnp.tile(context, (num_samples, 1))
 
-        def logprob_fn(m):
-            lnp = m(x, context, beta=1.0)
-            return lnp
+        # Tansform the context to the standardized form
+        context = self.preprocess_context(context)
 
+        # Sample from the trained network
+        key = jax.random.PRNGKey(seed)
+        def sampling_fn(m):
+            x = m.sample(num_samples=num_samples, rng=key, context=context, beta=beta)
+            return x
+        x = nn.apply(sampling_fn, self.model)(self.trained_params)
+
+        # Postprocess the samples
+        x = self.postprocess_x(x, context)
+
+        return jnp.array(x)
+
+    def log_prob(self, x, context, beta=1.0):
+        """
+        Evaluate the log-probability of the samples
+
+        Parameters:
+            x (array): The samples with shape (num_samples, n_dim)
+            context (array): The context for the sampling with shape (n_context,)
+
+        Returns:
+            array: The log-probability of the samples with shape (num_samples,)
+        """
+        # Format the context shape if necessary
+        num_samples = x.shape[0]
+        if context.ndim == 0 or context.ndim == 1:
+            context = jnp.tile(context, (num_samples, 1))
+
+        # Preprocess the samples
+        x       = self.preprocess_x(x, context)
+        context = self.preprocess_context(context)
+
+        # Evaluate the log-probability of the samples
+        def logprob_fn(m):
+            lnp = m(x, context, beta=beta)
+            return lnp
         log_prob = nn.apply(logprob_fn, self.model)(self.trained_params)
+
+        # Postprocess the log-probability
+        log_prob = self.postprocess_logprob(log_prob)
+
         return log_prob
+
+    # Sample processing functions
+    def compute_processing_params(self):
+        """
+        Compute the linear processing parameters for the MAF model.
+        """
+        # Get the samples of x and others separately
+        names_x = self.sampler.get_param_names(include='x')
+        names_c = self.sampler.get_param_names(exclude='x')
+        samples_x = self.sampler.get_samples(format=jnp.array, names=names_x)
+        samples_c = self.sampler.get_samples(format=jnp.array, names=names_c)
+
+        if self.process:
+            # Standardize the samples
+            mean_x = jnp.mean(samples_x, axis=0)
+            std_x  = jnp.std(samples_x, axis=0)
+            samples_x_standardized = (samples_x - mean_x) / std_x
+            mean_y = jnp.mean(samples_c, axis=0)
+            std_y  = jnp.std(samples_c, axis=0)
+            samples_c_standardized = (samples_c - mean_y) / std_y
+
+            # Get the covariance matrix
+            cov = jnp.cov(samples_x_standardized.T, samples_c_standardized.T)
+            cov_cc = cov[self.ndim_x:, self.ndim_x:]
+            cov_cx = cov[self.ndim_x:, :self.ndim_x]
+
+            # Get the linear transformation coefficients
+            dec_mat = jnp.linalg.solve(cov_cc, cov_cx).T
+
+            # Save the linear transformation coefficients
+            self.pp_params   = {'dec_mat': dec_mat, \
+                                'mean_x': mean_x, \
+                                'mean_c': mean_y, \
+                                'std_x': std_x, \
+                                'std_c': std_y}
+        else:
+            self.pp_params = {'dec_mat': jnp.zeros(self.ndim_x, self.ndim_c), \
+                              'mean_x': jnp.zeros(self.ndim_x), \
+                              'mean_c': jnp.zeros(self.ndim_c), \
+                              'std_x': jnp.ones(self.ndim_x), \
+                              'std_c': jnp.ones(self.ndim_c)}
+
+    def preprocess_context(self, samples_c):
+        """
+        Linear preprocess the context before inputting to the MAF model.
+        This function applies the standardization of the context samples.
+
+        Parameters:
+            samples_c (array): The original samples of context with shape 
+                               (num_samples, n_context)
+
+        Returns:
+            samples_c (array): The standardized samples of context with shape 
+                               (num_samples, n_context)
+        """
+        # Get the linear transformation coefficients
+        mean_c = self.pp_params['mean_c']
+        std_c  = self.pp_params['std_c']
+
+        # Standardize the samples
+        samples_c = (samples_c - mean_c) / std_c
+
+        return samples_c
+
+    def postprocess_context(self, samples_c):
+        """
+        Linear postprocess the context after training the MAF model.
+        This function applies the inverse transformation of the linear
+        preprocess function.
+
+        Parameters:
+            samples_c (array): The standardized samples of context with shape
+                               (num_samples, n_context)
+
+        Returns:
+            samples_c (array): The original samples of context with shape
+                               (num_samples, n_context)
+        """
+        # Get the linear transformation coefficients
+        mean_c = self.pp_params['mean_c']
+        std_c  = self.pp_params['std_c']
+
+        # Postprocess the samples
+        samples_c = samples_c * std_c + mean_c
+
+        return samples_c
+
+    def preprocess_x(self, samples_x, samples_c):
+        """
+        Linear preprocess the samples before training the MAF model.
+        If the x samples have linear correlation to the other model parameters,
+        this can be removed analytically. This linear correlation is removed
+        in this function.
+
+        We first standardize the samples of x and context separately.
+            X -> (X - mean(X)) / std(X)
+            C -> (C - mean(C)) / std(C)
+        Then we remove the linear correlation of x and context, assuming
+            X = M C + S
+
+        Parameters:
+            samples_x (array): The samples of x with shape (num_samples, ndim)
+            samples_c (array): The samples of context with shape (num_samples, n_context)
+        
+        Returns:
+            samples_x (array): The linearly preprocessed samples with shape (num_samples, ndim)
+        """
+        # Get the linear transformation coefficients
+        mean_c = self.pp_params['mean_c']
+        std_c  = self.pp_params['std_c']
+        mean_x = self.pp_params['mean_x']
+        std_x  = self.pp_params['std_x']
+        dec_mat= self.pp_params['dec_mat']
+
+        # Standardize the samples
+        samples_x_standardized = (samples_x - mean_x) / std_x
+        samples_c_standardized = (samples_c - mean_c) / std_c
+
+        # Decorrelate the x samples
+        samples_x_dec = samples_x_standardized - samples_c_standardized @ dec_mat.T
+
+        return samples_x_dec
+
+    def postprocess_x(self, samples_x, samples_c):
+        """
+        Linear postprocess the samples after training the MAF model.
+        This function applies the inverse transformation of the linear
+        preprocess function.
+
+        Parameters:
+            samples_x (array): The standardized samples of x with shape 
+                               (num_samples, ndim)
+            samples_c (array): The standardized samples of context with shape 
+                               (num_samples, n_context)
+
+        Returns:
+            samples_x (array): The postprocessed samples of x with shape 
+                               (num_samples, ndim)
+        """
+        # Get the linear transformation coefficients
+        mean_x = self.pp_params['mean_x']
+        std_x  = self.pp_params['std_x']
+        dec_mat= self.pp_params['dec_mat']
+        
+        # Add correlated part
+        samples_x = samples_x + samples_c @ dec_mat.T
+
+        # Postprocess the samples
+        samples_x = samples_x * std_x + mean_x
+
+        return samples_x
+
+    def postprocess_logprob(self, logp):
+        """
+        Correct the log-probability of the samples after training the MAF model.
+        Since we apply the linear preprocessing on the samples, the probabily we 
+        train with the MAF model is not the original probability. This function
+        corrects the log-probability to the original one. Since the preprocessing
+        is linear, the correction is done analytically. Denoting the original
+        sample `x` and the preprocessed sample `x`, the relation of the probability
+        is derived by the probability conservation:
+            dx P(x) = dx' P(x')
+        So the correction is the jacobian of the transformation:
+            log P(x) = log P(x') + log |det dx'/dx|
+        In our case, the transformation is linear, so the correction is simply
+            dx'/dx = 1 / std(x)
+        Note that shift term has nothinig to do with the Jacobian.
+        
+        Parameters:
+            logp (array): The log-probability of the preprocessed samples
+
+        Returns:
+            logp (array): The corrected log-probability of the samples
+        """
+        return logp - jnp.sum(jnp.log(self.pp_params['std_x']))
+
+    def get_training_samples(self):
+        """
+        Get the preprocessed samples for training the MAF model.
+
+        Returns:
+            array: The preprocessed samples for training the MAF model
+        """
+        # Get the samples of x and others separately
+        names_x = self.sampler.get_param_names(include='x')
+        names_c = self.sampler.get_param_names(exclude='x')
+        samples_x = self.sampler.get_samples(format=jnp.array, names=names_x)
+        samples_c = self.sampler.get_samples(format=jnp.array, names=names_c)
+
+        # Preprocess the samples
+        samples_x = self.preprocess_x(samples_x, samples_c)
+        samples_c = self.preprocess_context(samples_c)
+
+        # Concatenate the samples
+        samples = jnp.concatenate([samples_x, samples_c], axis=1)
+
+        return samples

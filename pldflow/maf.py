@@ -6,8 +6,8 @@ import jax.numpy as jnp
 import flax.linen as nn
 import distrax
 
-from models.bijectors import InverseConditional, ChainConditional, TransformedConditional, Permute
-from models.autoregressive import MAF, MADE
+from .bijectors import InverseConditional, ChainConditional, TransformedConditional, Permute
+from .autoregressive import MAF, MADE
 
 Array = Any
 

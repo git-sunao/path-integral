@@ -8,7 +8,7 @@ import flax.linen as nn
 from flax.linen.module import compact
 import distrax
 
-from models.bijectors import InverseConditional, ChainConditional, TransformedConditional, MaskedCouplingConditional
+from .bijectors import InverseConditional, ChainConditional, TransformedConditional, MaskedCouplingConditional
 
 Array = Any
 
