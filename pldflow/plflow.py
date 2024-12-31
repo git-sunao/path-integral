@@ -819,7 +819,7 @@ class MAFModel(object):
                                 'std_x': std_x, \
                                 'std_c': std_y}
         else:
-            self.pp_params = {'dec_mat': jnp.zeros(self.ndim_x, self.ndim_c), \
+            self.pp_params = {'dec_mat': jnp.zeros((self.ndim_x, self.ndim_c)), \
                               'mean_x': jnp.zeros(self.ndim_x), \
                               'mean_c': jnp.zeros(self.ndim_c), \
                               'std_x': jnp.ones(self.ndim_x), \
