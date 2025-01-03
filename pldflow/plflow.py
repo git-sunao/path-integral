@@ -8,8 +8,10 @@ from jax import vmap
 from jax import jacobian, hessian
 from jax import jacfwd, jacrev
 from jax import vjp
+from jax import jvp
 from jax.lax import scan
 from tqdm import tqdm
+from functools import partial
 # numpyro
 import numpyro
 import numpyro.distributions as npyro_dist
@@ -46,9 +48,11 @@ class PicardLefschetzModelBaseClass(object):
         complex_dtype (dtype): The dtype for the complex numbers
     """
     ndim: int = 1
-    def __init__(self):
+    def __init__(self, ndim=None):
         self.rescale_velocity = True
         self.complex_dtype = jnp.complex64
+        if ndim is not None:
+            self.ndim = ndim
 
     # Functions
     def action_s(self, z, *args, **kwargs):
@@ -64,6 +68,7 @@ class PicardLefschetzModelBaseClass(object):
         """
         raise NotImplementedError("action_s must be implemented in a subclass")
 
+    @partial(jit, static_argnums=(0,))
     def grad_s(self, z, *args, **kwargs):
         """
         Gradient of the action function dS/dz
@@ -78,6 +83,7 @@ class PicardLefschetzModelBaseClass(object):
         g = grad(self.action_s, argnums=0, holomorphic=True)
         return g(z, *args, **kwargs)
 
+    @partial(jit, static_argnums=(0,))
     def hessian_s(self, z, *args, **kwargs):
         """
         Hessian of the action function d^2S/dz^2
@@ -106,8 +112,7 @@ class PicardLefschetzModelBaseClass(object):
         s = self.action_s(z, *args, **kwargs)
         return jnp.exp(-s)
 
-    # PL flow
-    def flow_velocity(self, z, *args, **kwargs):
+    def velocity(self, z, *args, **kwargs):
         """
         Velocity of the Picard-Leffschetz flow dz/dt = v(z)
 
@@ -118,59 +123,78 @@ class PicardLefschetzModelBaseClass(object):
         Returns:
             v (array): The velocity of the flow evaluated at z with shape (ndim,)
         """
-        # Gradient of the action
-        dsdz = self.grad_s(z, *args, **kwargs)
         # Velocity for the flow
-        v    = jnp.conj(dsdz)
+        v    = jnp.conj(self.grad_s(z, *args, **kwargs))
         # Rescale the velocity
         if self.rescale_velocity:
             i = self.integrand(z, *args, **kwargs)
-            v = v * jnp.abs(i)**0.5
+            v = v * jnp.abs(i)
         return v
 
-    def flow(self, x, t, *args, **kwargs):
+    @partial(jit, static_argnums=(0,))
+    def velocity_divergence(self, z, *args, **kwargs):
         """
-        Solve the Picard-Lefschetz flow for a given initial condition x
+        Special divergence of the Picard-Lefschetz flow velocity,
+        which is used to obtain the approximate Jacobian of the flow.
+        What will be needed is the trace of the Jacobian where jacobian
+        is defined as the derivative of the flow with respect to the 
+        real part of the input variable.
 
         Parameters:
-            x (array): The real-valued initial condition with shape (ndim,)
+            z (array): The real or complex variable z with shape (ndim,)
+            args: Additional arguments to pass to the action function
+
+        Returns:
+            d (array): The divergence of the flow velocity evaluated at z, scalar
+        """
+        z_real = jnp.real(z)
+        z_imag = jnp.imag(z)
+
+        def func(x):
+            z_add = x + 1j * z_imag
+            v_val = self.velocity(z_add, *args, **kwargs)
+            return v_val
+
+        j = jacfwd(func)(z_real)
+        d = jnp.trace(j)
+
+        return d
+
+    # Flow related functions
+    @partial(jit, static_argnums=(0,), static_argnames=("uselast",))
+    def flow(self, x, t, *args, uselast=True, **kwargs):
+        """
+        Flow of the Picard-Lefschetz flow for a given initial condition z
+
+        Parameters:
+            x (array): The real variable z with shape (ndim,)
             t (array/scalar): The time array for integration
             args: Additional arguments to pass to the action function
             kwargs: Additional keyword arguments
 
         Returns:
             z (array): The solution of the flow at each time step with shape (ndim, t.size)
-
-        Notes:
-            The method of integration can be set with the keyword `method` (default is 'euler')
         """
-        # pop the method
-        method = kwargs.pop('method', 'euler')
-        uselast= kwargs.pop('uselast', False)
+        def step(z, dt):
+            """One step of Euler integration."""
+            z_new = z + dt * self.velocity(z, *args, **kwargs)
+            return z_new, z_new
 
-        # Initial condition and flow velocity
-        z0 = jnp.array(x, dtype=self.complex_dtype)
-        flow_vel = lambda z, t: self.flow_velocity(z, *args, **kwargs)
+        def integrate(z0):
+            """Perform Euler integration for a single initial condition."""
+            z = scan(step, z0, jnp.diff(t))[1]
+            z = jnp.concatenate([jnp.array([z0]), z])
+            return z
 
-        # Time array
-        if isinstance(t, (int, float)):
-            t = jnp.linspace(0, t, 2)
-            uselast = True
-
-        # Integration
-        if method == 'euler':
-            z = euler(flow_vel, z0, t)
-        elif method == 'odeint':
-            z = odeint(flow_vel, z0, t)
-        else:
-            raise ValueError(f"Invalid method {method=}")
+        z = integrate(x.astype(self.complex_dtype))
 
         if uselast:
-            return z[-1]
-        else:
-            return z
+            z = z[-1]
+
+        return z
     
-    def flow_jacobian(self, x, t, *args, **kwargs):
+    @partial(jit, static_argnums=(0,), static_argnames=("uselast",))
+    def flow_jacobian(self, x, t, *args, uselast=True, **kwargs):
         """
         Jacobian of the Picard-Lefschetz flow at a given initial condition x.
 
@@ -184,12 +208,51 @@ class PicardLefschetzModelBaseClass(object):
             j (array): The Jacobian of the flow evaluated at x with shape (ndim, ndim)
         """
         def flow_split(x):
-            z = self.flow(x, t, *args, **kwargs)
+            z = self.flow(x, t, *args, uselast=uselast, **kwargs)
             return jnp.real(z), jnp.imag(z)
-        # j = jacrev(flow_split)(x)
         j = jacobian(flow_split)(x)
         j = j[0] + 1j * j[1]
         return jnp.linalg.det(j)
+
+    @partial(jit, static_argnums=(0,), static_argnames=("uselast", "withz"))
+    def flow_jacobian_approx(self, x, t, *args, uselast=True, withz=True, **kwargs):
+        """
+        Approximated Jacobian of the Picard-Lefschetz flow at a given initial condition x.
+
+        Parameters:
+            x (array): The real-valued initial condition with shape (ndim,)
+            t (array/scalar): The time array for integration
+            args: Additional arguments to pass to the action function
+            kwargs: Additional keyword arguments
+
+        Returns:
+            j (array): The approximated Jacobian of the flow evaluated at x with shape (ndim, ndim)
+        """
+        def step(z_and_j, dt):
+            """One step of Euler integration."""
+            z, j = z_and_j
+            z_new = z + dt * self.velocity(z, *args, **kwargs)
+            # j_new = j + dt * self.velocity_divergence(z, *args, **kwargs)
+            j_new = j * jnp.exp(dt * self.velocity_divergence(z, *args, **kwargs))
+            return (z_new, j_new), (z_new, j_new)
+        
+        def integrate(z0_and_j0):
+            """Perform Euler integration for a single initial condition."""
+            z, j = scan(step, z0_and_j0, jnp.diff(t))[1]
+            z = jnp.concatenate([jnp.array([z0_and_j0[0]]), z])
+            j = jnp.concatenate([jnp.array([z0_and_j0[1]]), j])
+            return z, j
+        
+        z, j = integrate((x.astype(self.complex_dtype), 1.0))
+
+        if uselast:
+            z = z[-1]
+            j = j[-1]
+
+        if withz :
+            return z, j
+        else:
+            return j
 
     # Integration with samples
     def integrate(self, x_samples, lnp_samples, t, *args, **kwargs):
@@ -208,16 +271,38 @@ class PicardLefschetzModelBaseClass(object):
         Returns:
             Z (scalar): The integrated value of the integrand
         """
-        from time import time
         def ij(x_sample):
-            t0 = time()
             z = self.flow(x_sample, t, uselast=True, *args, **kwargs)
-            t1 = time()
-            j = self.flow_jacobian(x_sample, t, uselast=True, *args, **kwargs)
-            t2 = time()
+            j = self.flow_jacobian(x_sample, t, *args, uselast=True, **kwargs)
             i = self.integrand(z, *args, **kwargs)
-            t3 = time()
-            # print(f"Flow: {t1-t0:.3f} sec, Jacobian: {t2-t1:.3f} sec, Integrand: {t3-t2:.3f} sec ")
+            return i, j
+        # We should cut samples with very small probability to avoid numerical issues
+        min_lnp = kwargs.pop('min_lnp', -6)
+        sel = lnp_samples > lnp_samples.max() + min_lnp
+        # Integrate the integrand
+        i, j = vmap(ij)(x_samples[sel])
+        Z = jnp.mean(i*j*jnp.exp(-lnp_samples[sel]), axis=0)
+        return Z
+
+    def integrate_approx(self, x_samples, lnp_samples, t, *args, **kwargs):
+        """
+        Integrate the integrand I(z) = e^{-S(z)} based on the importance 
+        sampling using the samples of x provided with the corresponding 
+        log-probability lnp_samples.
+
+        Parameters:
+            x_samples (array): The samples of x with shape (nsamples, ndim)
+            lnp_samples (array): The log-probability of the samples with shape (nsamples,)
+            t (array/scalar): The time array for integration
+            args: Additional arguments to pass to the action function
+            kwargs: Additional keyword arguments
+        
+        Returns:
+            Z (scalar): The integrated value of the integrand
+        """
+        def ij(x_sample):
+            z, j = self.flow_jacobian_approx(x_sample, t, *args, uselast=True, withz=True, **kwargs)
+            i = self.integrand(z, *args, **kwargs)
             return i, j
         # We should cut samples with very small probability to avoid numerical issues
         min_lnp = kwargs.pop('min_lnp', -6)
@@ -247,6 +332,16 @@ class PicardLefschetzModelBaseClass(object):
         """Vectorized integrand function"""
         i = vmap(lambda zin: self.integrand(zin, *args, **kwargs), in_axes=0, out_axes=0)
         return i(z)
+    
+    def vvelocity(self, z, *args, **kwargs):
+        """Vectorized flow velocity function"""
+        v = vmap(lambda zin: self.velocity(zin, *args, **kwargs), in_axes=0, out_axes=0)
+        return v(z)
+
+    def vvelocity_divergence(self, z, *args, **kwargs):
+        """Vectorized flow velocity divergence function"""
+        d = vmap(lambda zin: self.velocity_divergence(zin, *args, **kwargs), in_axes=0, out_axes=0)
+        return d(z)
 
     def vflow(self, z, t, *args, **kwargs):
         """Vectorized flow function"""
@@ -256,6 +351,11 @@ class PicardLefschetzModelBaseClass(object):
     def vflow_jacobian(self, z, t, *args, **kwargs):
         """Vectorized flow Jacobian function"""
         f = vmap(lambda zin: self.flow_jacobian(zin, t, *args, **kwargs), in_axes=0, out_axes=0)
+        return f(z)
+    
+    def vflow_jacobian_approx(self, z, t, *args, **kwargs):
+        """Vectorized approximated flow Jacobian function"""
+        f = vmap(lambda zin: self.flow_jacobian_approx(zin, t, *args, **kwargs), in_axes=0, out_axes=0)
         return f(z)
 
     # Plotter
@@ -295,7 +395,7 @@ class PicardLefschetzModelBaseClass(object):
 
         if isinstance(t, (int, float)):
             t = jnp.linspace(0, t, 2)
-        z = self.vflow(x, t, *args, **kwargs)
+        z = self.vflow(x, t, *args, uselast=False, **kwargs)
         iz= self.vintegrand(z.reshape(-1, self.ndim), *args, **kwargs).reshape(-1, t.size)
 
         color = []
@@ -337,7 +437,7 @@ class PicardLefschetzModelBaseClass(object):
 
         if isinstance(t, (int, float)):
             t = jnp.linspace(0, t, 2)
-        z = self.vflow(x, t, *args, **kwargs)
+        z = self.vflow(x, t, *args, uselast=False, **kwargs)
         iz= self.vintegrand(z.reshape(-1, self.ndim), *args, **kwargs).reshape(-1, t.size)
 
         fig, (ax1, ax2) = self._plot1d_template()
@@ -669,7 +769,8 @@ class MAFModel(object):
         config  =  {'seed': 0, \
                     'learning_rate': 3e-4, \
                     'batch_size': 64, \
-                    'n_steps': 1000}
+                    'n_steps': 1000, 
+                    'patience': 20}
         # Overwrite the default configuration
         config.update(config_in)
 
@@ -701,14 +802,28 @@ class MAFModel(object):
         samples = self.get_training_samples()
 
         # Training loop!
+        best_loss = float("inf")
+        steps_without_improvement = 0
         self.loss_history_maf = []
         key = jax.random.PRNGKey(config['seed'])
-        for _ in tqdm(range(config['n_steps']), desc="Training MAF"):
+        for step_idx in tqdm(range(config['n_steps']), desc="Training MAF"):
             key, subkey = jax.random.split(key)
             indices = jax.random.choice(subkey, samples.shape[0], shape=(64,), replace=False)
             batch = (samples[indices, :self.ndim_x], samples[indices, self.ndim_x:])
             params, opt_state, loss = step(params, opt_state, batch)
             self.loss_history_maf.append(loss)
+
+            # Early stopping logic
+            if loss < best_loss:
+                best_loss = loss
+                steps_without_improvement = 0  # Reset the counter
+            else:
+                steps_without_improvement += 1  # Increment the counter
+
+            # Stop training if no improvement for 'patience' steps
+            if steps_without_improvement >= config['patience']:
+                print(f"Early stopping at step {step_idx + 1} with best loss {best_loss}")
+                break
 
         self.trained_params = params
 
@@ -716,12 +831,12 @@ class MAFModel(object):
         """Plot the training loss"""
         plt.figure(figsize=(5,3))
         plt.plot(self.loss_history_maf)
-        plt.yscale('log')
         plt.xlabel('Step')
         plt.ylabel('Loss')
         plt.title('Training Loss')
         plt.show()
 
+    @partial(jit, static_argnums=(0,2,3,4))
     def sample(self, context, num_samples=10000, seed=0, beta=1.0):
         """
         Sample from the trained MAF model
@@ -743,16 +858,14 @@ class MAFModel(object):
 
         # Sample from the trained network
         key = jax.random.PRNGKey(seed)
-        def sampling_fn(m):
-            x = m.sample(num_samples=num_samples, rng=key, context=context, beta=beta)
-            return x
-        x = nn.apply(sampling_fn, self.model)(self.trained_params)
+        x = self.model.apply(self.trained_params, num_samples=num_samples, rng=key, context=context, beta=beta, method='sample')
 
         # Postprocess the samples
         x = self.postprocess_x(x, context)
 
         return jnp.array(x)
 
+    @partial(jit, static_argnums=(0,3))
     def log_prob(self, x, context, beta=1.0):
         """
         Evaluate the log-probability of the samples
@@ -774,10 +887,7 @@ class MAFModel(object):
         context = self.preprocess_context(context)
 
         # Evaluate the log-probability of the samples
-        def logprob_fn(m):
-            lnp = m(x, context, beta=beta)
-            return lnp
-        log_prob = nn.apply(logprob_fn, self.model)(self.trained_params)
+        log_prob = self.model.apply(self.trained_params, x=x, context=context, beta=beta, method='__call__')
 
         # Postprocess the log-probability
         log_prob = self.postprocess_logprob(log_prob)
