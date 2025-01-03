@@ -271,6 +271,7 @@ class PicardLefschetzModelBaseClass(object):
         Returns:
             Z (scalar): The integrated value of the integrand
         """
+        error = kwargs.pop('error', False)
         def ij(x_sample):
             z = self.flow(x_sample, t, uselast=True, *args, **kwargs)
             j = self.flow_jacobian(x_sample, t, *args, uselast=True, **kwargs)
@@ -282,7 +283,14 @@ class PicardLefschetzModelBaseClass(object):
         # Integrate the integrand
         i, j = vmap(ij)(x_samples[sel])
         Z = jnp.mean(i*j*jnp.exp(-lnp_samples[sel]), axis=0)
-        return Z
+        if error:
+            dZ = jnp.std( (i*j*jnp.exp(-lnp_samples[sel])).real, axis=0)
+            dZ+= jnp.std( (i*j*jnp.exp(-lnp_samples[sel])).imag, axis=0)*1j
+            n_sample = jnp.sum(sel)
+            dZ/= jnp.sqrt(n_sample)
+            return Z, dZ
+        else:
+            return Z
 
     def integrate_approx(self, x_samples, lnp_samples, t, *args, **kwargs):
         """
@@ -868,6 +876,8 @@ class MAFModel(object):
     @partial(jit, static_argnums=(0,3))
     def log_prob(self, x, context, beta=1.0):
         """
+        Caution: This is slow. Using sample_and_log_prob is recommended.
+
         Evaluate the log-probability of the samples
 
         Parameters:
@@ -893,6 +903,25 @@ class MAFModel(object):
         log_prob = self.postprocess_logprob(log_prob)
 
         return log_prob
+
+    @partial(jit, static_argnums=(0,2,3,4))
+    def sample_and_log_prob(self, context, num_samples=10000, seed=0, beta=1.0):
+        # Format the context shape if necessary
+        if context.ndim == 0 or context.ndim == 1:
+            context = jnp.tile(context, (num_samples, 1))
+
+        # Tansform the context to the standardized form
+        context = self.preprocess_context(context)
+
+        # Sample from the trained network
+        key = jax.random.PRNGKey(seed)
+        x, log_prob = self.model.apply(self.trained_params, num_samples=num_samples, rng=key, context=context, beta=beta, method='sample_and_log_prob')
+        
+        # Postprocess the samples
+        x = self.postprocess_x(x, context)
+        log_prob = self.postprocess_logprob(log_prob)
+        
+        return jnp.array(x), jnp.array(log_prob)
 
     # Sample processing functions
     def compute_processing_params(self):

@@ -50,7 +50,7 @@ class TransformedConditional(Transformed):
         lp_y = lp_x + ildj_y#/beta
         return lp_y
 
-    def sample_and_log_prob(self, seed: PRNGKey, sample_shape: List[int], context: Optional[Array] = None) -> Tuple[Array, Array]:
+    def sample_and_log_prob(self, seed: PRNGKey, sample_shape: List[int], context: Optional[Array] = None, beta: Optional[float] = 1.0) -> Tuple[Array, Array]:
         x, lp_x = self.distribution.sample_and_log_prob(seed=seed, sample_shape=sample_shape)
         y, fldj = jax.vmap(self.bijector.forward_and_log_det)(x, context)
         lp_y = jax.vmap(jnp.subtract)(lp_x, fldj)
