@@ -673,9 +673,9 @@ class HMCSampler(object):
         """
         nuts_kernel = NUTS(self.likelihood_model)
         self.mcmc = MCMC(nuts_kernel, num_warmup=num_warmup, num_samples=num_samples)
-        cpu_device = jax.devices('cpu')[0]
-        with jax.default_device(cpu_device):
-            self.mcmc.run(jax.random.PRNGKey(seed), **like_kwargs)
+        # cpu_device = jax.devices('cpu')[0]
+        # with jax.default_device(cpu_device):
+        self.mcmc.run(jax.random.PRNGKey(seed), **like_kwargs)
 
     # Getter functions
     def get_samples(self, format=jnp.array, names=None):
