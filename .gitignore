@@ -1,3 +1,7 @@
+# testcode output
+testcodes/*.png
+testcodes/*.txt
+
 
 # VSCode
 .vscode/
