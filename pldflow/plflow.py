@@ -50,7 +50,7 @@ class PicardLefschetzModelBaseClass(object):
     """
     ndim: int = 1
     def __init__(self, ndim=None):
-        self.rescale_velocity = True
+        self.rescale_velocity = False
         self.complex_dtype = jnp.complex64
         if ndim is not None:
             self.ndim = ndim
@@ -128,15 +128,9 @@ class PicardLefschetzModelBaseClass(object):
         v    = jnp.conj(self.grad_s(z, *args, **kwargs))
         # Rescale the velocity
         if self.rescale_velocity:
-            # Exponential rescaling
-            # i = self.integrand(z, *args, **kwargs)
-            # v = v * jnp.abs(i)
-            # Polynomial rescaling, this is better. 
-            # s = self.action_s(z, *args, **kwargs).real
-            # v = v / (1+jnp.abs(s))
             # Exponential + polynomial rescaling
             s = self.action_s(z, *args, **kwargs).real
-            v = v / (1+jnp.abs(s)+jnp.exp(s)/1e3)
+            v = v * 2 / (1+jnp.abs(s)+jnp.exp(s)/1e3)
         return v
 
     @partial(jit, static_argnums=(0,))
@@ -182,19 +176,49 @@ class PicardLefschetzModelBaseClass(object):
 
         Returns:
             z (array): The solution of the flow at each time step with shape (ndim, t.size)
-        """
-        def step(z, dt):
-            """One step of Euler integration."""
-            z_new = z + dt * self.velocity(z, *args, **kwargs)
-            return z_new, z_new
 
-        def integrate(z0):
+        Algorithm:
+            The flow equation dz/dt = v(z) is solved using the Euler method,
+            with some modifications to ensure the monotonic increase of the action.
+            The naive application of the Euler method derives
+
+            .. math::
+                z(t+dt) = z(t) + dt * v(z(t))
+            
+            However, this may not guarantee the monotonic increase of the action,
+            especially when the action has singularity around which the numerical
+            flow can be unstable. To avoid this, we apply the following algorithm:
+
+            1.  Compute the next point with the naive Euler method
+            2.  If the next point has a larger action, accept it, otherwise 
+                keep the current point, and accumulate the number of stay at 
+                the position (we call it n in this func).
+            3.  In the next loop, we rescale the shift term by 2^n to try smaller
+                steps to avoid the singularity.
+
+            This effectively slows down the flow sorresponding to the adoptive 
+            time step to avoid the singularity.
+        """
+        def step(zsn, dt):
+            """One step of Euler integration."""
+            z, s, n = zsn
+            z_tmp = z + dt * self.velocity(z, *args, **kwargs) / 2.0**n
+            s_tmp = self.action_s(z_tmp, *args, **kwargs).real
+            z_new = jnp.where(s_tmp >= s, z_tmp, z)
+            s_new = jnp.where(s_tmp >= s, s_tmp, s)
+            n_new = jnp.where(s_tmp >= s, 0, n+1)
+            return (z_new, s_new, n_new), (z_new, s_new, n_new)
+
+        def integrate(z0s0n0):
             """Perform Euler integration for a single initial condition."""
-            z = scan(step, z0, jnp.diff(t))[1]
-            z = jnp.concatenate([jnp.array([z0]), z])
+            z, s, n = scan(step, z0s0n0, jnp.diff(t))[1]
+            z = jnp.concatenate([jnp.array([z0s0n0[0]]), z])
             return z
 
-        z = integrate(x.astype(self.complex_dtype))
+        z0= x.astype(self.complex_dtype)
+        s0= self.action_s(z0, *args, **kwargs).real
+        n0= jnp.zeros_like(x)
+        z = integrate((z0,s0,n0))
 
         if uselast:
             z = z[-1]
@@ -225,6 +249,8 @@ class PicardLefschetzModelBaseClass(object):
     @partial(jit, static_argnums=(0,), static_argnames=("uselast", "withz"))
     def flow_jacobian_approx(self, x, t, *args, uselast=True, withz=True, **kwargs):
         """
+        [Warning] This function is not recommended for the general use.
+
         Approximated Jacobian of the Picard-Lefschetz flow at a given initial condition x.
 
         Parameters:
@@ -236,22 +262,28 @@ class PicardLefschetzModelBaseClass(object):
         Returns:
             j (array): The approximated Jacobian of the flow evaluated at x with shape (ndim, ndim)
         """
-        def step(z_and_j, dt):
+        def step(zjs, dt):
             """One step of Euler integration."""
-            z, j = z_and_j
-            z_new = z + dt * self.velocity(z, *args, **kwargs)
-            # j_new = j + dt * self.velocity_divergence(z, *args, **kwargs)
-            j_new = j * jnp.exp(dt * self.velocity_divergence(z, *args, **kwargs))
-            return (z_new, j_new), (z_new, j_new)
+            z, j, s = zjs
+            z_tmp = z + dt * self.velocity(z, *args, **kwargs)
+            s_tmp = self.action_s(z_tmp, *args, **kwargs).real
+            j_tmp = j * jnp.exp(dt * self.velocity_divergence(z, *args, **kwargs))
+            z_new = jnp.where(s_tmp >= s, z_tmp, z)
+            j_new = jnp.where(s_tmp >= s, j_tmp, j)
+            s_new = jnp.where(s_tmp >= s, s_tmp, s)
+            return (z_new, j_new, s_new), (z_new, j_new, s_new)
         
-        def integrate(z0_and_j0):
+        def integrate(z0j0s0):
             """Perform Euler integration for a single initial condition."""
-            z, j = scan(step, z0_and_j0, jnp.diff(t))[1]
+            z, j, s = scan(step, z0j0s0, jnp.diff(t))[1]
             z = jnp.concatenate([jnp.array([z0_and_j0[0]]), z])
             j = jnp.concatenate([jnp.array([z0_and_j0[1]]), j])
             return z, j
         
-        z, j = integrate((x.astype(self.complex_dtype), 1.0))
+        z0 = x.astype(self.complex_dtype)
+        j0 = 1.0
+        s0 = self.action_s(z0, *args, **kwargs).real
+        z, j = integrate((z0, j0, s0))
 
         if uselast:
             z = z[-1]
@@ -479,18 +511,21 @@ class PicardLefschetzModelBaseClass(object):
             (ax1, ax2) = kwargs.pop('axes')
         else:
             fig, (ax1, ax2) = self._plot1d_template()
-        
+
         # xmin, xmax
         xmin = kwargs.pop('xmin', x.min())
         xmax = kwargs.pop('xmax', x.max())
         ymin = kwargs.pop('ymin', xmin)
         ymax = kwargs.pop('ymax', xmax)
-        
+
         # color
         color = kwargs.pop('color', 'blue')
 
         # dpi for saving
         dpi = kwargs.pop('dpi', 100)
+
+        # animation writer
+        writer = kwargs.pop('writer', 'ffmpeg')
 
         if isinstance(t, (int, float)):
             t = jnp.linspace(0, t, 2)
@@ -511,9 +546,9 @@ class PicardLefschetzModelBaseClass(object):
             line3.set_data(x[:,dim], jnp.imag(iz[:,i]))
             line4.set_data(x[:,dim], jnp.abs(iz[:,i]))
             return line1, line2, line3, line4
-        
-        ani = FuncAnimation(fig, update, frames=t.size, interval=50, blit=True)
-        ani.save(fname, writer="pillow", dpi=dpi)
+
+        ani = FuncAnimation(fig, update, frames=t.size, interval=50, blit=False)
+        ani.save(fname, writer=writer, dpi=dpi)
 
     def plot1d_action_map(self, n, *args, **kwargs):
         """
@@ -543,12 +578,12 @@ class PicardLefschetzModelBaseClass(object):
         cmap = kwargs.pop('cmap', 'PuOr')
         # shading
         shading = kwargs.pop('shading', None)
+
         zx = jnp.linspace(-3,3,n)
         zy = jnp.linspace(-3,3,n)
         z = jnp.tile(zx, zy.size) + 1j*jnp.repeat(zy, zx.size)
         z = z.reshape(-1, self.ndim)
         s = self.vaction_s(z, *args, **kwargs).reshape(zx.size, zy.size)
-        # ax.pcolormesh(zx, zy, jnp.abs(s), cmap=cmap, alpha=1)
         ax.pcolormesh(zx, zy, -s.real, cmap=cmap, alpha=1, shading=shading)
         return fig, (ax,)
 
@@ -563,6 +598,21 @@ class HMCSampler(object):
         param_names (list): The list of parameter names
         group_names (list): The list of group names
         group_ndims (dict): The dictionary of group names and their dimensions
+
+    Note on format of input priors:
+        The priors should be a dictionary with the following format:
+        {
+            # For n-diemsional variable 'x', you can set the prior as
+            'x': (xmin, xmax, ndim),
+            # If you want to overwrite the prior for each dimension, you can set as
+            'x1': (x1min, x1max),
+            'x2': (x2min, x2max),
+            # If you want to set a prior on a scalar parameter, you can set as
+            'p': (ymin, ymax),
+            # If you want to set a fixed scalar/vector parameter, you can set as
+            'f': value
+            'v': jnp.array([v1, v2, ...])
+        }
     """
     def __init__(self, plmodel, priors):
         """
@@ -586,19 +636,19 @@ class HMCSampler(object):
         self.priors = dict()
         # 1. populate the priors from the grouped priors
         for k, v in priors.items():
-            if isinstance(v, (float, int)) or len(v)!=3: continue
+            if (not isinstance(v, tuple)) or len(v)!=3: continue
             vmin, vmax, ndim = v
             for i in range(ndim):
                 self.priors[f"{k}{i+1}"] = (vmin, vmax)
         # 2. populate the priors for ungrouped priors
         for k, v in priors.items():
-            if isinstance(v, (float, int)) or len(v)!=2: continue
+            if (not isinstance(v, tuple)) or len(v)!=2: continue
             vmin, vmax = v
             self.priors[k] = (vmin, vmax)
         # 3. pupolate the fixed parameters
         self.fixed_params = dict()
         for k, v in priors.items():
-            if not isinstance(v, (float, int)): continue
+            if not isinstance(v, (float, int, jnp.ndarray)): continue
             self.fixed_params[k] = v
         
         # Set parameter names
@@ -606,14 +656,14 @@ class HMCSampler(object):
         self.group_names = []
         # 1. populate the priors from the grouped priors
         for k, v in priors.items():
-            if isinstance(v, (float, int)) or len(v)!=3: continue
+            if (not isinstance(v, tuple)) or len(v)!=3: continue
             vmin, vmax, ndim = v
             for i in range(ndim):
                 self.param_names.append(f"{k}{i+1}")
                 self.group_names.append(k)
         # 2. populate the priors for ungrouped priors
         for k, v in priors.items():
-            if isinstance(v, (float, int)) or len(v)!=2: continue
+            if (not isinstance(v, tuple)) or len(v)!=2: continue
             if k in self.param_names: continue
             self.param_names.append(k)
             self.group_names.append(k)
@@ -762,21 +812,22 @@ class HMCSampler(object):
         # Set likelihood and derived values
         numpyro.factor('loglike', lnp)
 
-    def sample(self, num_samples=5000, num_warmup=500, seed=0, **like_kwargs):
+    def sample(self, num_samples=1000, num_warmup=200, seed=0, num_chains=5, **run_kwargs):
         """
         Sample the parameters using the likelihood model
 
         Parameters:
             num_samples (int): The number of samples to generate
             num_warmup (int): The number of warmup samples
+            num_chains (int): The number of chains
             seed (int): The seed for random number generation
             like_kwargs (dict): The keyword arguments for the likelihood model
         """
         nuts_kernel = NUTS(self.likelihood_model)
-        self.mcmc = MCMC(nuts_kernel, num_warmup=num_warmup, num_samples=num_samples)
+        self.mcmc = MCMC(nuts_kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains)
         # cpu_device = jax.devices('cpu')[0]
         # with jax.default_device(cpu_device):
-        self.mcmc.run(jax.random.PRNGKey(seed), **like_kwargs)
+        self.mcmc.run(jax.random.PRNGKey(seed), **run_kwargs)
 
     # Getter functions
     def get_samples(self, format=jnp.array, names=None):
@@ -999,6 +1050,19 @@ class MAFModel(object):
 
     @partial(jit, static_argnums=(0,2,3,4))
     def sample_and_log_prob(self, context, num_samples=1_000, seed=0, beta=1.0):
+        """
+        Sample from the trained MAF model and evaluate the log-probability
+
+        Parameters:
+            context (array): The context for the sampling with shape (n_context,)
+            num_samples (int): The number of samples to generate
+            seed (int): The seed for random number generation
+            beta (float): The temperature for the sampling
+
+        Returns:
+            array: The samples from the MAF model with shape (num_samples, n_dim)
+            array: The log-probability of the samples with shape (num_samples,)
+        """
         # Format the context shape if necessary
         if context.ndim == 0 or context.ndim == 1:
             context = jnp.tile(context, (num_samples, 1))
