@@ -35,6 +35,7 @@ from .maf import MaskedAutoregressiveFlow
 # odeint
 from jax.experimental.ode import odeint
 from .odeint import euler
+from tabulate import tabulate
 
 class PicardLefschetzModelBaseClass(object):
     """
@@ -127,8 +128,15 @@ class PicardLefschetzModelBaseClass(object):
         v    = jnp.conj(self.grad_s(z, *args, **kwargs))
         # Rescale the velocity
         if self.rescale_velocity:
-            i = self.integrand(z, *args, **kwargs)
-            v = v * jnp.abs(i)
+            # Exponential rescaling
+            # i = self.integrand(z, *args, **kwargs)
+            # v = v * jnp.abs(i)
+            # Polynomial rescaling, this is better. 
+            # s = self.action_s(z, *args, **kwargs).real
+            # v = v / (1+jnp.abs(s))
+            # Exponential + polynomial rescaling
+            s = self.action_s(z, *args, **kwargs).real
+            v = v / (1+jnp.abs(s)+jnp.exp(s)/1e3)
         return v
 
     @partial(jit, static_argnums=(0,))
@@ -270,6 +278,13 @@ class PicardLefschetzModelBaseClass(object):
         
         Returns:
             Z (scalar): The integrated value of the integrand
+
+        Notes:
+            Acceptable keyword arguments for this function are:
+            - error   : Whether to estimate the error of the integral (default is False)
+                        This error is the statistical error of the integral due to the 
+                        finite number of samples. The systematics error is not included.
+            - min_lnp : The minimum log-probability to consider the samples (default is -6)
         """
         error = kwargs.pop('error', False)
         def ij(x_sample):
@@ -277,17 +292,16 @@ class PicardLefschetzModelBaseClass(object):
             j = self.flow_jacobian(x_sample, t, *args, uselast=True, **kwargs)
             i = self.integrand(z, *args, **kwargs)
             return i, j
+        # Integrand
+        i, j = vmap(ij)(x_samples)
+        integrand = i*j*jnp.exp(-lnp_samples)
         # We should cut samples with very small probability to avoid numerical issues
         min_lnp = kwargs.pop('min_lnp', -6)
-        sel = lnp_samples > lnp_samples.max() + min_lnp
-        # Integrate the integrand
-        i, j = vmap(ij)(x_samples[sel])
-        Z = jnp.mean(i*j*jnp.exp(-lnp_samples[sel]), axis=0)
+        mask = lnp_samples > lnp_samples.max() + min_lnp
+        Z  = jnp.mean(integrand, axis=0, where=mask)
+        dZ = jnp.std( integrand.real, axis=0, where=mask) + 1j*jnp.std( integrand.imag, axis=0, where=mask)      
+        dZ/= jnp.sqrt(jnp.sum(mask, axis=0))
         if error:
-            dZ = jnp.std( (i*j*jnp.exp(-lnp_samples[sel])).real, axis=0)
-            dZ+= jnp.std( (i*j*jnp.exp(-lnp_samples[sel])).imag, axis=0)*1j
-            n_sample = jnp.sum(sel)
-            dZ/= jnp.sqrt(n_sample)
             return Z, dZ
         else:
             return Z
@@ -366,6 +380,10 @@ class PicardLefschetzModelBaseClass(object):
         f = vmap(lambda zin: self.flow_jacobian_approx(zin, t, *args, **kwargs), in_axes=0, out_axes=0)
         return f(z)
 
+    def vintegrate_with_sampler(self, context, num_samples, sampler):
+        i = vmap(lambda context: self.integrate_with_sampler(context, num_samples, sampler), in_axes=0, out_axes=0)
+        return i(context)
+
     # Plotter
     def _plot1d_template(self, fig=None, axes=None):
         """Template for the 1D plotter"""
@@ -381,7 +399,7 @@ class PicardLefschetzModelBaseClass(object):
         ax2.set_ylabel(r'$I(x) = e^{-S(x)}$')
         return fig, [ax1, ax2]
 
-    def plot1d(self, x, t, *args, **kwargs):
+    def plot1d(self, x, t, *args, t_indices=None, **kwargs):
         """
         Plot the flow of the Picard-Lefschetz flow in 1D
 
@@ -401,10 +419,19 @@ class PicardLefschetzModelBaseClass(object):
         # dimension to plot
         dim = kwargs.pop('dim', 0)
 
+        # sort x for better visualization
+        x = x[jnp.argsort(x[:, dim]), :]
+
         if isinstance(t, (int, float)):
             t = jnp.linspace(0, t, 2)
         z = self.vflow(x, t, *args, uselast=False, **kwargs)
         iz= self.vintegrand(z.reshape(-1, self.ndim), *args, **kwargs).reshape(-1, t.size)
+
+        if t_indices is not None:
+            t_indices = jnp.array(t_indices)
+            t = t[t_indices]
+            z = z[:,t_indices]
+            iz= iz[:,t_indices]
 
         color = []
         for i in range(t.size):
@@ -439,23 +466,44 @@ class PicardLefschetzModelBaseClass(object):
         Notes:
             Acceptable keyword arguments for this function are:
             - dim: The dimension to plot (default is 0)
+            - fig: The figure for the plot
+            - axes: The axes for the plot
+            - color: The color for the plot
         """
         # dimension to plot
         dim = kwargs.pop('dim', 0)
+
+        # fig and axes
+        if 'fig' in kwargs and 'axes' in kwargs:
+            fig = kwargs.pop('fig')
+            (ax1, ax2) = kwargs.pop('axes')
+        else:
+            fig, (ax1, ax2) = self._plot1d_template()
+        
+        # xmin, xmax
+        xmin = kwargs.pop('xmin', x.min())
+        xmax = kwargs.pop('xmax', x.max())
+        ymin = kwargs.pop('ymin', xmin)
+        ymax = kwargs.pop('ymax', xmax)
+        
+        # color
+        color = kwargs.pop('color', 'blue')
+
+        # dpi for saving
+        dpi = kwargs.pop('dpi', 100)
 
         if isinstance(t, (int, float)):
             t = jnp.linspace(0, t, 2)
         z = self.vflow(x, t, *args, uselast=False, **kwargs)
         iz= self.vintegrand(z.reshape(-1, self.ndim), *args, **kwargs).reshape(-1, t.size)
 
-        fig, (ax1, ax2) = self._plot1d_template()
-        ax1.set_xlim(x.min(),x.max())
-        ax1.set_ylim(x.min(),x.max())
+        ax1.set_xlim(xmin, xmax)
+        ax1.set_ylim(ymin, ymax)
         ax2.set_ylim(-1.1, 1.1)
-        line1, = ax1.plot([], [], marker='.', color='blue', lw=2)
-        line2, = ax2.plot([], [], ls='--', color='blue')
-        line3, = ax2.plot([], [], ls='-.', color='blue')
-        line4, = ax2.plot([], [], ls='-', color='blue')
+        line1, = ax1.plot([], [], marker='.', color=color, lw=2)
+        line2, = ax2.plot([], [], ls='--', color=color)
+        line3, = ax2.plot([], [], ls='-.', color=color)
+        line4, = ax2.plot([], [], ls='-', color=color)
 
         def update(i):
             line1.set_data(z[:,i,dim].real, z[:,i,dim].imag)
@@ -465,7 +513,44 @@ class PicardLefschetzModelBaseClass(object):
             return line1, line2, line3, line4
         
         ani = FuncAnimation(fig, update, frames=t.size, interval=50, blit=True)
-        ani.save(fname, writer="pillow")
+        ani.save(fname, writer="pillow", dpi=dpi)
+
+    def plot1d_action_map(self, n, *args, **kwargs):
+        """
+        Plot the action map in 1D
+
+        Parameters:
+            n (int): The number of points to plot
+            args: Additional arguments to pass to the action function
+            kwargs: Additional keyword arguments
+
+        Returns:
+            fig, ax: The figure and axes for the plot
+
+        Notes:
+            Acceptable keyword arguments for this function are:
+            - fig: The figure for the plot
+            - axes: The axes for the plot
+            - cmap: The colormap for the plot (default is "PuOr")
+        """
+        # fig and axes
+        if 'fig' in kwargs and 'axes' in kwargs:
+            fig = kwargs.pop('fig')
+            ax = kwargs.pop('axes')[0]
+        else:
+            fig, ax = plt.subplots()
+        # cmap
+        cmap = kwargs.pop('cmap', 'PuOr')
+        # shading
+        shading = kwargs.pop('shading', None)
+        zx = jnp.linspace(-3,3,n)
+        zy = jnp.linspace(-3,3,n)
+        z = jnp.tile(zx, zy.size) + 1j*jnp.repeat(zy, zx.size)
+        z = z.reshape(-1, self.ndim)
+        s = self.vaction_s(z, *args, **kwargs).reshape(zx.size, zy.size)
+        # ax.pcolormesh(zx, zy, jnp.abs(s), cmap=cmap, alpha=1)
+        ax.pcolormesh(zx, zy, -s.real, cmap=cmap, alpha=1, shading=shading)
+        return fig, (ax,)
 
 
 class HMCSampler(object):
@@ -501,29 +586,34 @@ class HMCSampler(object):
         self.priors = dict()
         # 1. populate the priors from the grouped priors
         for k, v in priors.items():
-            if len(v) == 2: continue
+            if isinstance(v, (float, int)) or len(v)!=3: continue
             vmin, vmax, ndim = v
             for i in range(ndim):
                 self.priors[f"{k}{i+1}"] = (vmin, vmax)
         # 2. populate the priors for ungrouped priors
         for k, v in priors.items():
-            if len(v) == 3: continue
+            if isinstance(v, (float, int)) or len(v)!=2: continue
             vmin, vmax = v
             self.priors[k] = (vmin, vmax)
+        # 3. pupolate the fixed parameters
+        self.fixed_params = dict()
+        for k, v in priors.items():
+            if not isinstance(v, (float, int)): continue
+            self.fixed_params[k] = v
         
         # Set parameter names
         self.param_names = []
         self.group_names = []
         # 1. populate the priors from the grouped priors
         for k, v in priors.items():
-            if len(v) == 2: continue
+            if isinstance(v, (float, int)) or len(v)!=3: continue
             vmin, vmax, ndim = v
             for i in range(ndim):
                 self.param_names.append(f"{k}{i+1}")
                 self.group_names.append(k)
         # 2. populate the priors for ungrouped priors
         for k, v in priors.items():
-            if len(v) == 3: continue
+            if isinstance(v, (float, int)) or len(v)!=2: continue
             if k in self.param_names: continue
             self.param_names.append(k)
             self.group_names.append(k)
@@ -654,6 +744,9 @@ class HMCSampler(object):
                     parameter.append(p)
                 parameter = jnp.array(parameter)
             parameters[gname] = parameter
+        
+        # append fixed params
+        parameters.update(self.fixed_params)
             
         # flow
         z = self.plmodel.flow(t=t, uselast=True, **parameters)
@@ -905,7 +998,7 @@ class MAFModel(object):
         return log_prob
 
     @partial(jit, static_argnums=(0,2,3,4))
-    def sample_and_log_prob(self, context, num_samples=10000, seed=0, beta=1.0):
+    def sample_and_log_prob(self, context, num_samples=1_000, seed=0, beta=1.0):
         # Format the context shape if necessary
         if context.ndim == 0 or context.ndim == 1:
             context = jnp.tile(context, (num_samples, 1))
@@ -1119,3 +1212,41 @@ class MAFModel(object):
         samples = jnp.concatenate([samples_x, samples_c], axis=1)
 
         return samples
+
+    def summary(self):
+        def process_layer(params, parent_name=""):
+            """collect the parameters and their sizes in a nested dictionary"""
+            layer_table = []
+            total_params = 0
+            total_bytes = 0
+
+            for key, value in params.items():
+                current_name = f"{parent_name}/{key}" if parent_name else key
+
+                if isinstance(value, dict):  # if value is a nested dictionary
+                    sub_table, sub_params, sub_bytes = process_layer(value, current_name)
+                    layer_table.extend(sub_table)
+                    total_params += sub_params
+                    total_bytes += sub_bytes
+                else:  # process the parameter
+                    param_count = jnp.prod(jnp.array(value.shape))
+                    param_bytes = param_count * jnp.dtype(value.dtype).itemsize
+                    layer_table.append([current_name, param_count, f"{param_bytes / 1024**2:.2f} MB"])
+                    total_params += param_count
+                    total_bytes += param_bytes
+
+            return layer_table, total_params, total_bytes
+
+        # start processing the parameters
+        table, total_params, total_bytes = process_layer(self.trained_params['params'])
+
+        # print the summary
+        print(tabulate(
+            table, 
+            headers=["Layer Name", "Parameter Count", "Memory (Bytes)"], 
+            tablefmt="pretty"
+        ))
+
+        # print the total number of parameters and memory
+        print(f"\nTotal Parameters: {total_params}")
+        print(f"Total Memory: {total_bytes / 1024**2:.2f} MB")
