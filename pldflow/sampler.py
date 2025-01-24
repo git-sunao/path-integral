@@ -235,13 +235,14 @@ class ConditionallikelihoodSampler:
 
 
 class NDESampler:
-    def __init__(self, xsamples, csamples, process=True):
-        self.xsamples = xsamples
-        self.csamples = csamples
-        self.nsamples = xsamples.shape[0]
-        self.xndim    = xsamples.shape[1]
-        self.cndim    = csamples.shape[1]
-        self.process  = process
+    def __init__(self, xsamples, csamples, normalize=True, decorrelate=False):
+        self.xsamples   = xsamples
+        self.csamples   = csamples
+        self.nsamples   = xsamples.shape[0]
+        self.xndim      = xsamples.shape[1]
+        self.cndim      = csamples.shape[1]
+        self.normalize  = normalize
+        self.decorrelate= decorrelate
         self.compute_processing_params()
 
     def buildMAF(self, **config_in):
@@ -464,35 +465,34 @@ class NDESampler:
         """
         Compute the linear processing parameters for the MAF model.
         """
-        if self.process:
+        self.processing_params = {}
+
+        xsamples = self.xsamples
+        csamples = self.csamples
+
+        # Normalization
+        if self.normalize:
             # Standardize the samples
             xmean = jnp.mean(self.xsamples, axis=0)
             xstd  = jnp.std(self.xsamples, axis=0)
-            samples_x_standardized = (self.xsamples - xmean) / xstd
+            xsamples = (self.xsamples - xmean) / xstd
             cmean = jnp.mean(self.csamples, axis=0)
             cstd  = jnp.std(self.csamples, axis=0)
-            samples_c_standardized = (self.csamples - cmean) / cstd
+            csamples = (self.csamples - cmean) / cstd
+            self.processing_params['xmean'] = xmean
+            self.processing_params['xstd']  = xstd
+            self.processing_params['cmean'] = cmean
+            self.processing_params['cstd']  = cstd
 
+        # Linear decorrelation
+        if self.decorrelate:
             # Get the covariance matrix
-            cov = jnp.cov(samples_x_standardized.T, samples_c_standardized.T)
+            cov = jnp.cov(xsamples.T, csamples.T)
             cov_cc = cov[self.xndim:, self.xndim:]
             cov_cx = cov[self.xndim:, :self.xndim]
-
             # Get the linear transformation coefficients
             dec_mat = jnp.linalg.solve(cov_cc, cov_cx).T
-
-            # Save the linear transformation coefficients
-            self.pp_params   = {'dec_mat': dec_mat, \
-                                'xmean': xmean, \
-                                'cmean': cmean, \
-                                'xstd': xstd, \
-                                'cstd': cstd}
-        else:
-            self.pp_params = {'dec_mat': jnp.zeros((self.xndim, self.cndim)), \
-                              'xmean': jnp.zeros(self.xndim), \
-                              'cmean': jnp.zeros(self.cndim), \
-                              'xstd': jnp.ones(self.xndim), \
-                              'cstd': jnp.ones(self.cndim)}
+            self.processing_params['dec_mat'] = dec_mat
 
     def preprocess_context(self, csamples):
         """
@@ -507,12 +507,12 @@ class NDESampler:
             csamples (array): The standardized samples of context with shape 
                                (num_samples, n_context)
         """
-        # Get the linear transformation coefficients
-        cmean = self.pp_params['cmean']
-        cstd  = self.pp_params['cstd']
+        csamples = jnp.array(csamples)
 
-        # Standardize the samples
-        csamples = (csamples - cmean) / cstd
+        if self.normalize:
+            cmean = self.processing_params['cmean']
+            cstd  = self.processing_params['cstd']
+            csamples = (csamples - cmean) / cstd
 
         return csamples
 
@@ -530,12 +530,12 @@ class NDESampler:
             csamples (array): The original samples of context with shape
                                (num_samples, n_context)
         """
-        # Get the linear transformation coefficients
-        cmean = self.pp_params['cmean']
-        cstd  = self.pp_params['cstd']
+        csamples = jnp.array(csamples)
 
-        # Postprocess the samples
-        csamples = csamples * cstd + cmean
+        if self.normalize:
+            cmean = self.processing_params['cmean']
+            cstd  = self.processing_params['cstd']
+            csamples = csamples * cstd + cmean
 
         return csamples
 
@@ -559,21 +559,22 @@ class NDESampler:
         Returns:
             xsamples (array): The linearly preprocessed samples with shape (num_samples, ndim)
         """
-        # Get the linear transformation coefficients
-        cmean = self.pp_params['cmean']
-        cstd  = self.pp_params['cstd']
-        xmean = self.pp_params['xmean']
-        xstd  = self.pp_params['xstd']
-        dec_mat= self.pp_params['dec_mat']
+        xsamples = jnp.array(xsamples)
+        csamples = jnp.array(csamples)
 
-        # Standardize the samples
-        xsamples_standardized = (xsamples - xmean) / xstd
-        csamples_standardized = (csamples - cmean) / cstd
+        if self.normalize:
+            cmean = self.processing_params['cmean']
+            cstd  = self.processing_params['cstd']
+            xmean = self.processing_params['xmean']
+            xstd  = self.processing_params['xstd']
+            xsamples = (xsamples - xmean) / xstd
+            csamples = (csamples - cmean) / cstd
 
-        # Decorrelate the x samples
-        xsamples_dec = xsamples_standardized - csamples_standardized @ dec_mat.T
-
-        return xsamples_dec
+        if self.decorrelate:
+            dec_mat = self.processing_params['dec_mat']
+            xsamples = xsamples - csamples @ dec_mat.T
+        
+        return xsamples
 
     def postprocess_x(self, xsamples, csamples):
         """
@@ -591,16 +592,17 @@ class NDESampler:
             xsamples (array): The postprocessed samples of x with shape 
                                (num_samples, ndim)
         """
-        # Get the linear transformation coefficients
-        xmean = self.pp_params['xmean']
-        xstd  = self.pp_params['xstd']
-        dec_mat= self.pp_params['dec_mat']
-        
-        # Add correlated part
-        xsamples = xsamples + csamples @ dec_mat.T
+        xsamples = jnp.array(xsamples)
+        csamples = jnp.array(csamples)
 
-        # Postprocess the samples
-        xsamples = xsamples * xstd + xmean
+        if self.decorrelate:
+            dec_mat = self.processing_params['dec_mat']
+            xsamples = xsamples + csamples @ dec_mat.T
+
+        if self.normalize:
+            xmean = self.processing_params['xmean']
+            xstd  = self.processing_params['xstd']
+            xsamples = xsamples * xstd + xmean
 
         return xsamples
 
@@ -626,4 +628,10 @@ class NDESampler:
         Returns:
             logp (array): The corrected log-probability of the samples
         """
-        return logp - jnp.sum(jnp.log(self.pp_params['xstd']))
+        logp = jnp.array(logp)
+
+        if self.normalize:
+            xstd = self.processing_params['xstd']
+            logp = logp - jnp.sum(jnp.log(xstd))
+
+        return logp

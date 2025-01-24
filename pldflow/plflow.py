@@ -30,7 +30,6 @@ class PicardLefschetzModelBaseClass(object):
     """
     ndim: int = 1
     def __init__(self, ndim=None):
-        self.rescale_velocity = False
         self.complex_dtype = jnp.complex64
         if ndim is not None:
             self.ndim = ndim
@@ -106,11 +105,6 @@ class PicardLefschetzModelBaseClass(object):
         """
         # Velocity for the flow
         v    = jnp.conj(self.grad_s(z, *args, **kwargs))
-        # Rescale the velocity
-        if self.rescale_velocity:
-            # Exponential + polynomial rescaling
-            s = self.action_s(z, *args, **kwargs).real
-            v = v * 2 / (1+jnp.abs(s)+jnp.exp(s)/1e3)
         return v
 
     @partial(jit, static_argnums=(0,))
