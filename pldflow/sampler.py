@@ -219,7 +219,7 @@ class ConditionallikelihoodSampler:
         mcmc.run(rng_key or jax.random.PRNGKey(seed), **like_kwargs)
         return mcmc
 
-    def sample_xpsamples(self, num_psamples, num_warmup, num_xsamples, num_chains, 
+    def sample_xpsamples(self, num_warmup, num_xsamples, num_chains, num_psamples=1, 
             seed=0, xprogress_bar=False, pprogress_bar=True, thin=1, **like_kwargs):
         loop = range(num_psamples) if not pprogress_bar else tqdm(range(num_psamples))
         for _ in loop:
