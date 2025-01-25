@@ -1,19 +1,15 @@
 # jax
 import jax
 import jax.numpy as jnp
-import jax.scipy as jsp
 from jax import jit
 from jax import grad
 from jax import vmap
 from jax import jacobian, hessian
-from jax import jacfwd, jacrev
-from jax import vjp
-from jax import jvp
+from jax import jacfwd
 from jax.lax import scan
 from tqdm import tqdm
 from functools import partial
 # plottting
-from getdist import MCSamples
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 

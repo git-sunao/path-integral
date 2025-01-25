@@ -37,27 +37,25 @@ import numpy as np
 class SobolSampler:
     def __init__(self, ranges, names=None):
         """
-        ranges: dict
-            パラメータ名をキー、(min, max)の範囲を値として指定
-        names: list or None
-            使用するパラメータ名のリスト。Noneの場合、rangesの全パラメータを使用
+        Parameters:
+            ranges (dict): The dictionary of the form {name: (min, max)}
+            names (list): The list of names of the random
         """
         self.ranges = ranges
         self.names = names if names is not None else list(ranges.keys())
         self.ndim = len(self.names)
         self.sampler = qmc.Sobol(d=self.ndim, scramble=True)
-        self.total_samples = 0  # 今までに生成したサンプル数
+        self.total_samples = 0
 
     def generate(self, n_samples):
         """
-        Sobol列を生成して範囲をスケールします。
-        n_samples: int
-            生成するサンプル数
+        Generate Sobol samples and scale the range.
+
+        Parameters:
+            n_samples (int): The number of samples to generate
         """
-        # Sobol列を生成
         samples = self.sampler.random(n=n_samples)
 
-        # JAXでスケール変換
         def scale_sample(sample):
             return jnp.array([
                 sample[i] * (self.ranges[name][1] - self.ranges[name][0]) + self.ranges[name][0]
@@ -69,7 +67,16 @@ class SobolSampler:
         return scaled_samples
 
 class ConditionallikelihoodSampler:
+    """
+    This class is a sampler for the conditional likelihoods.
+    """
     def __init__(self, likelihood, xranges, pranges=None):
+        """
+        Parameters:
+            likelihood (function): The likelihood function.
+            xranges (dict): The dictionary of the form {name: (min, max)}
+            pranges (dict): The dictionary of the form {name: (min, max)}
+        """
         self.likelihood = likelihood
         self.set_xranges(xranges)
         self.set_pranges(pranges or {})
@@ -158,13 +165,16 @@ class ConditionallikelihoodSampler:
         self.pndim  = len(self.pnames)
 
     def initialize_sobol_sampler(self):
+        """This function initializes the Sobol sampler."""
         self.sobol = SobolSampler(self.pranges)
 
     def initialize_samples_placeholder(self):
+        """This function initializes the samples placeholder."""
         self.xsamples = jnp.zeros((0, self.xndim))
         self.psamples = jnp.zeros((0, self.pndim))
 
     def add_xpsamples(self, xsamples, psamples):
+        """This function adds samples to the placeholder."""
         self.xsamples = jnp.vstack([self.xsamples, xsamples])
         self.psamples = jnp.vstack([self.psamples, psamples])
         self.nsamples = self.xsamples.shape[0]
@@ -192,6 +202,13 @@ class ConditionallikelihoodSampler:
         return gsamples
 
     def numpyro_likelihood_model(self, gpsample, **kwargs):
+        """
+        This function defines the numpyro likelihood model.
+
+        Parameters:
+            gpsample (dict): The grouped samples of parameters.
+            kwargs (dict): The additional keyword arguments.
+        """
         # x variable
         gxsample = []
         for name in self.xnames:
@@ -212,6 +229,21 @@ class ConditionallikelihoodSampler:
 
     def sample_xsamples(self, num_warmup, num_samples, num_chains, 
             rng_key=None, seed=0, progress_bar=False, **like_kwargs):
+        """
+        This function samples the x samples.
+
+        Parameters:
+            num_warmup (int): The number of warmup steps.
+            num_samples (int): The number of samples.
+            num_chains (int): The number of chains.
+            rng_key (jax.random.PRNGKey): The random key.
+            seed (int): The seed for random number generation.
+            progress_bar (bool): Whether to show the progress bar.
+            like_kwargs (dict): The additional keyword arguments.
+
+        Returns:
+            numpyro.MCMC: The MCMC object
+        """
         nuts_kernel = NUTS(self.numpyro_likelihood_model)
         mcmc = MCMC(nuts_kernel, num_warmup=num_warmup, 
             num_samples=num_samples, num_chains=num_chains, 
@@ -221,6 +253,20 @@ class ConditionallikelihoodSampler:
 
     def sample_xpsamples(self, num_warmup, num_xsamples, num_chains, num_psamples=1, 
             seed=0, xprogress_bar=False, pprogress_bar=True, thin=1, **like_kwargs):
+        """
+        This function samples the x samples.
+
+        Parameters:
+            num_warmup (int): The number of warmup steps.
+            num_xsamples (int): The number of samples.
+            num_chains (int): The number of chains.
+            num_psamples (int): The number of parameter samples.
+            seed (int): The seed for random number generation.
+            xprogress_bar (bool): Whether to show the progress bar for x samples.
+            pprogress_bar (bool): Whether to show the progress bar for p samples.
+            thin (int): The thinning factor.
+            like_kwargs (dict): The additional keyword arguments.
+        """
         loop = range(num_psamples) if not pprogress_bar else tqdm(range(num_psamples))
         for _ in loop:
             psample = self.sobol.generate(1)[0]
@@ -235,7 +281,19 @@ class ConditionallikelihoodSampler:
 
 
 class NDESampler:
+    """
+    This class is a sampler for the Neural Density Estimation (NDE) models.
+    """
     def __init__(self, xsamples, csamples, normalize=True, decorrelate=False):
+        """
+        Initialize the NDE sampler
+
+        Parameters:
+            xsamples (array): The samples of the random variable with shape (num_samples, ndim)
+            csamples (array): The samples of the context variable with shape (num_samples, n_context)
+            normalize (bool): Whether to normalize the samples
+            decorrelate (bool): Whether to decorrelate the samples
+        """
         self.xsamples   = xsamples
         self.csamples   = csamples
         self.nsamples   = xsamples.shape[0]
@@ -282,8 +340,8 @@ class NDESampler:
                     'n_dim': self.xndim, \
                     'n_context': self.cndim, \
                     'n_bins': 16, \
-                    'range_min': self.xsamples.min(), \
-                    'range_max': self.xsamples.max()}
+                    'range_min': -3.0, \
+                    'range_max': +3.0}
         # Overwrite the default configuration
         config.update(config_in)
         # Initialize the MAF model
