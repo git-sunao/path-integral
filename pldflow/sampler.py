@@ -201,13 +201,15 @@ class ConditionallikelihoodSampler:
                 gsamples[gname] = samples[names.index(info['names'][0])]
         return gsamples
 
-    def numpyro_likelihood_model(self, gpsample, **kwargs):
+    def numpyro_likelihood_model(self, **kwargs):
         """
         This function defines the numpyro likelihood model.
 
         Parameters:
-            gpsample (dict): The grouped samples of parameters.
             kwargs (dict): The additional keyword arguments.
+
+        Note:
+            kwargs should include the conditioning parameter as well.
         """
         # x variable
         gxsample = []
@@ -218,7 +220,6 @@ class ConditionallikelihoodSampler:
 
         # likelihood inputs
         likelihood_inputs = {}
-        likelihood_inputs.update(gpsample)
         likelihood_inputs.update(gxsample)
         likelihood_inputs.update(kwargs)
 
@@ -228,7 +229,8 @@ class ConditionallikelihoodSampler:
         numpyro.factor('loglike', lnlike)
 
     def sample_xsamples(self, num_warmup, num_samples, num_chains, 
-            rng_key=None, seed=0, progress_bar=False, **like_kwargs):
+            rng_key=None, seed=0, progress_bar=False, 
+            gpsample=None, **like_kwargs):
         """
         This function samples the x samples.
 
@@ -244,15 +246,30 @@ class ConditionallikelihoodSampler:
         Returns:
             numpyro.MCMC: The MCMC object
         """
+        # Parse the gpsample (comditioning parametrs)
+        if gpsample is None and self.pndim > 0:
+            raise ValueError("The parameter sample is not provided.")
+        elif gpsample is None:
+            gpsample = dict()
+        if not isinstance(gpsample, dict):
+            raise ValueError("The gpsample must be a dictionary.")
+        # Add the conditioning parameters to the likelihood arguments
+        like_kwargs.update(gpsample)
+        # Run MCMC
         nuts_kernel = NUTS(self.numpyro_likelihood_model)
         mcmc = MCMC(nuts_kernel, num_warmup=num_warmup, 
             num_samples=num_samples, num_chains=num_chains, 
             progress_bar=progress_bar)
         mcmc.run(rng_key or jax.random.PRNGKey(seed), **like_kwargs)
-        return mcmc
+        # Add x samples as jnp.array
+        xsamples = mcmc.get_samples()
+        xsamples = jnp.transpose(jnp.array([xsamples[name] for name in self.xnames]))
+        psample  = jnp.array([gpsample[name] for name in self.pnames])
+        psamples = jnp.array([psample]*num_chains*num_samples)
+        self.add_xpsamples(xsamples, psamples)
 
     def sample_xpsamples(self, num_warmup, num_xsamples, num_chains, num_psamples=1, 
-            seed=0, xprogress_bar=False, pprogress_bar=True, thin=1, **like_kwargs):
+            seed=0, xprogress_bar=False, pprogress_bar=True, **like_kwargs):
         """
         This function samples the x samples.
 
@@ -271,13 +288,9 @@ class ConditionallikelihoodSampler:
         for _ in loop:
             psample = self.sobol.generate(1)[0]
             gpsample = self.group_samples(self.pgnames, self.pnames, psample)
-            mcmc = self.sample_xsamples(num_warmup, num_xsamples, num_chains, 
-                seed=seed, progress_bar=xprogress_bar, gpsample=gpsample, **like_kwargs)
-            # Get new xpsamples
-            xsamples = mcmc.get_samples()
-            xsamples = jnp.transpose(jnp.array([xsamples[name] for name in self.xnames]))
-            psamples = jnp.array([psample]*num_chains*num_xsamples)
-            self.add_xpsamples(xsamples[::thin], psamples[::thin])
+            like_kwargs.update(gpsample)
+            self.sample_xsamples(num_warmup, num_xsamples, num_chains, 
+                seed=seed, progress_bar=xprogress_bar, **like_kwargs)
 
 
 class NDESampler:
@@ -318,34 +331,36 @@ class NDESampler:
             - use_random_permutations: Whether to use random permutations (default is False)
         """
         # Default configuration
-        config =   {'hidden_dims': [128, 128], \
-                    'activation': "tanh", \
-                    'n_transforms': 4, \
-                    'use_random_permutations': False, 
-                    'n_dim': self.xndim, \
-                    'n_context': self.cndim}
+        self.model_config ={'hidden_dims': [128, 128], \
+                            'activation': "tanh", \
+                            'n_transforms': 4, \
+                            'use_random_permutations': False, 
+                            'n_dim': self.xndim, \
+                            'n_context': self.cndim}
         # Overwrite the default configuration
-        config.update(config_in)
+        self.model_config.update(config_in)
         # Initialize the MAF model
-        self.model = MaskedAutoregressiveFlow(**config)
+        self.model = MaskedAutoregressiveFlow(**self.model_config)
+        self.model_name = 'MAF'
 
     def buildNSF(self, **config_in):
         """
         Build the NSF model
         """
         # Default configuration
-        config =   {'hidden_dims': [128, 128], \
-                    'activation': "tanh", \
-                    'n_transforms': 4, \
-                    'n_dim': self.xndim, \
-                    'n_context': self.cndim, \
-                    'n_bins': 16, \
-                    'range_min': -3.0, \
-                    'range_max': +3.0}
+        self.model_config ={'hidden_dims': [128, 128], \
+                            'activation': "tanh", \
+                            'n_transforms': 4, \
+                            'n_dim': self.xndim, \
+                            'n_context': self.cndim, \
+                            'n_bins': 16, \
+                            'range_min': -3.0, \
+                            'range_max': +3.0}
         # Overwrite the default configuration
-        config.update(config_in)
+        self.model_config.update(config_in)
         # Initialize the MAF model
-        self.model = NeuralSplineFlow(**config)
+        self.model = NeuralSplineFlow(**self.model_config)
+        self.model_name = 'NSF'
 
     def train(self, **config_in):
         """
@@ -693,3 +708,43 @@ class NDESampler:
             logp = logp - jnp.sum(jnp.log(xstd))
 
         return logp
+
+    def save(self, filename):
+        """
+        Save the model. We will only save the model components
+        that is neccessary to reproduce the results. More specifically,
+        - The trained parameters
+        - The processing parameters
+        - The configuration
+        """
+        # Save the model components
+        model_components = {
+            'trained_params': self.trained_params,
+            'normalize': self.normalize,
+            'decorrelate': self.decorrelate,
+            'processing_params': self.processing_params,
+            'model_config': self.model_config,
+            'model_name': self.model_name
+        }
+        torch.save(model_components, filename)
+
+    def load(self, filename):
+        """
+        Load the model from the file
+        """
+        # Load the model components
+        model_components = torch.load(filename)
+        self.trained_params = model_components['trained_params']
+        self.normalize = model_components['normalize']
+        self.decorrelate = model_components['decorrelate']
+        self.processing_params = model_components['processing_params']
+        self.model_config = model_components['model_config']
+        self.model_name = model_components['model_name']
+        # Initialize the model
+        if self.model_name == 'MAF':
+            self.buildMAF(**self.model_config)
+        elif self.model_name == 'NSF':
+            self.buildNSF(**self.model_config)
+        else:
+            raise ValueError("Unknown model name")
+        
