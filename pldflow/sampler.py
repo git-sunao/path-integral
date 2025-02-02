@@ -33,6 +33,8 @@ from scipy.stats import qmc
 # Plot
 import matplotlib.pyplot as plt
 import numpy as np
+# Interpolation
+from .utils import LinearInterp, gaussian_filter_jax, unique_rows_via_columns
 
 class SobolSampler:
     def __init__(self, ranges, names=None):
@@ -748,3 +750,73 @@ class NDESampler:
         else:
             raise ValueError("Unknown model name")
         
+class InverseFunctionaSampler:
+    """
+    This class is a sampler for generic distritbution
+    based on the inverse function method, where the inverse
+    function is estimated from a given samples.
+    """
+    def __init__(self, x, thin=1, n_filter=0):
+        """
+        Initialize the inverse function sampler
+
+        Parameters:
+            x (array): The samples of the random variable with shape (num_samples, ndim)
+            thin (int): The thinning factor for the samples
+        """
+        self.x = x
+        self.preprocess(thin=thin, n_filter=n_filter)
+        self.interp = LinearInterp(self.u, self.x)
+        
+    def preprocess(self, thin=1, n_filter=0):
+        x = self.x
+        
+        # Reshape into 2d
+        self.is_scalar = x.ndim == 1
+        if self.is_scalar:
+            x = jnp.reshape(x, (-1,1))            
+
+        # ndim    
+        self.ndim = x.shape[1]
+            
+        # Sort
+        x = jnp.sort(x, axis=0)
+        # Thin
+        x = x[::thin,:]
+        
+        # Take unique
+        # x = jnp.unique(x, axis=0)
+        x = unique_rows_via_columns(x)
+
+        # Uniformly distributed u \in [0,1]
+        nx= x.shape[0]
+        u = jnp.linspace(0, 1, nx)
+
+        if n_filter > 0:
+            x = gaussian_filter_jax(x, n_filter, extrap=True, axis=0)
+            
+        self.x = x
+        self.u = u
+    
+    def sample_u(self, size, PRNGKey=None):
+        if PRNGKey is None:
+            PRNGKey = jax.random.PRNGKey(0)
+        u = jax.random.uniform(PRNGKey, shape=(size, self.ndim), minval=0, maxval=1)
+        return u
+    
+    def sample_x(self, size, PRNGKey=None):
+        u = self.sample_u(size, PRNGKey)
+        x = self.interp(u)
+        return x
+    
+    def sample_u_and_lnp(self, size, PRNGKey=None):
+        u = self.sample_u(size, PRNGKey)
+        lnp = jnp.zeros(size)
+        return u, lnp
+    
+    def sample_x_and_lnp(self, size, PRNGKey=None):
+        u, lnp = self.sample_u_and_lnp(size, PRNGKey)
+        x,i = self.interp(u, return_idx=True)
+        a = self.interp.parse_i(self.interp.a, i)
+        lnp -= jnp.sum(jnp.log(jnp.abs(a)), axis=1)
+        return x, lnp

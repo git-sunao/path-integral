@@ -289,6 +289,7 @@ class PicardLefschetzModelBaseClass(object):
             - min_lnp : The minimum log-probability to consider the samples (default is -6)
         """
         error = kwargs.pop('error', False)
+        min_lnp = kwargs.pop('min_lnp', -6)
         def ij(x_sample):
             z = self.flow(x_sample, t, uselast=True, *args, **kwargs)
             j = self.flow_jacobian(x_sample, t, *args, uselast=True, **kwargs)
@@ -298,7 +299,6 @@ class PicardLefschetzModelBaseClass(object):
         i, j = vmap(ij)(x_samples)
         integrand = i*j*jnp.exp(-lnp_samples)
         # We should cut samples with very small probability to avoid numerical issues
-        min_lnp = kwargs.pop('min_lnp', -6)
         mask = lnp_samples > lnp_samples.max() + min_lnp
         Z  = jnp.mean(integrand, axis=0, where=mask)
         dZ = jnp.std( integrand.real, axis=0, where=mask) + 1j*jnp.std( integrand.imag, axis=0, where=mask)      
